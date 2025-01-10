@@ -1,0 +1,16 @@
+[package]
+name = "kcp-sys"
+version = "0.1.0"
+edition = "2021"
+authors = ["sunsijie@buaa.edu.cn"]
+description = "Safe bindings for KCP transport protocol"
+repository = "https://github.com/EasyTier/kcp-sys"
+readme = "README.md"
+license = "MIT"
+keywords = ["kcp", "bindings"]
+
+[dependencies]
+
+[build-dependencies]
+bindgen = "0.71.1"
+cc = "1.2.7"
