@@ -10,6 +10,12 @@ license = "MIT"
 keywords = ["kcp", "bindings"]
 
 [dependencies]
+bytes = "1"
+tokio = { version = "1", features = ["full"] }
+dashmap = "6.1.0"
+zerocopy = { version = "0.7", features = ["derive", "simd"] }
+bitflags = "2.5"
+parking_lot = "0.12.3"
 
 [build-dependencies]
 bindgen = "0.71.1"
