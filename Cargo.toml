@@ -12,11 +12,18 @@ keywords = ["kcp", "bindings"]
 [dependencies]
 bytes = "1"
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7.13" }
 dashmap = "6.1.0"
 zerocopy = { version = "0.7", features = ["derive", "simd"] }
-bitflags = "2.5"
+bitflags = "2.8.0"
 parking_lot = "0.12.3"
+auto_impl = "1.2.1"
+thiserror = "2.0.11"
+anyhow = "1.0.95"
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
+rand = "0.8.5"
 
 [build-dependencies]
 bindgen = "0.71.1"
-cc = "1.2.7"
+cc = "1.2.10"

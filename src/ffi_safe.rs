@@ -30,6 +30,19 @@ impl KcpConfig {
             nc: None,
         }
     }
+
+    pub fn new_turbo(conv: IUINT32) -> Self {
+        Self {
+            conv,
+            mtu: Some(1200),
+            sndwnd: Some(1024),
+            rcvwnd: Some(1024),
+            nodelay: Some(1),
+            interval: Some(10),
+            resend: Some(2),
+            nc: Some(1),
+        }
+    }
 }
 
 pub type OutputCb = Box<dyn Fn(u32, BytesMut) -> Result<(), Error>>;
@@ -81,6 +94,8 @@ impl Kcp {
                 return Err(Error::CreateConnectionFailed);
             }
 
+            (*kcp).stream = 1;
+
             ret.kcp = kcp;
 
             ikcp_setoutput(kcp, Some(ikcp_output));
@@ -98,7 +113,7 @@ impl Kcp {
     pub fn handle_input(&mut self, data: &[u8]) -> Result<(), Error> {
         let ret = unsafe { ikcp_input(self.kcp, data.as_ptr() as *const i8, data.len() as i64) };
         if ret < 0 {
-            return Err(Error::Unknown);
+            return Err(anyhow::anyhow!("input failed, return: {}", ret).into());
         } else {
             return Ok(());
         }
@@ -119,17 +134,27 @@ impl Kcp {
     pub fn send(&mut self, data: Bytes) -> Result<usize, Error> {
         let ret = unsafe { ikcp_send(self.kcp, data.as_ptr() as *const i8, data.len() as i32) };
         if ret < 0 {
-            return Err(Error::Unknown);
+            return Err(anyhow::anyhow!("send failed, return: {}", ret).into());
         } else {
             return Ok(ret as usize);
         }
+    }
+
+    pub fn flush(&mut self) {
+        unsafe {
+            ikcp_flush(self.kcp);
+        }
+    }
+
+    pub fn peeksize(&self) -> i32 {
+        unsafe { ikcp_peeksize(self.kcp) }
     }
 
     pub fn recv(&mut self, buf: &mut BytesMut) -> Result<(), Error> {
         let ret =
             unsafe { ikcp_recv(self.kcp, buf.as_mut_ptr() as *mut i8, buf.capacity() as i32) };
         if ret < 0 {
-            return Err(Error::Unknown);
+            return Err(anyhow::anyhow!("recv failed, return: {}", ret).into());
         } else {
             unsafe {
                 buf.set_len(ret as usize);
@@ -155,7 +180,7 @@ impl Kcp {
         unsafe {
             let ret = ikcp_setmtu(self.kcp, self.config.mtu.unwrap_or(1200));
             if ret < 0 {
-                return Err(Error::Unknown);
+                return Err(anyhow::anyhow!("setmtu failed, return: {}", ret).into());
             }
 
             let ret = ikcp_wndsize(
@@ -164,7 +189,7 @@ impl Kcp {
                 self.config.rcvwnd.unwrap_or(-1),
             );
             if ret < 0 {
-                return Err(Error::Unknown);
+                return Err(anyhow::anyhow!("wndsize failed, return: {}", ret).into());
             }
 
             let ret = ikcp_nodelay(
@@ -175,7 +200,7 @@ impl Kcp {
                 self.config.nc.unwrap_or(-1),
             );
             if ret < 0 {
-                return Err(Error::Unknown);
+                return Err(anyhow::anyhow!("nodelay failed, return: {}", ret).into());
             }
         }
 
