@@ -111,7 +111,7 @@ impl Kcp {
     }
 
     pub fn handle_input(&mut self, data: &[u8]) -> Result<(), Error> {
-        let ret = unsafe { ikcp_input(self.kcp, data.as_ptr() as *const i8, data.len() as i64) };
+        let ret = unsafe { ikcp_input(self.kcp, data.as_ptr() as *const _, data.len() as _) };
         if ret < 0 {
             return Err(anyhow::anyhow!("input failed, return: {}", ret).into());
         } else {
@@ -132,7 +132,7 @@ impl Kcp {
     }
 
     pub fn send(&mut self, data: Bytes) -> Result<usize, Error> {
-        let ret = unsafe { ikcp_send(self.kcp, data.as_ptr() as *const i8, data.len() as i32) };
+        let ret = unsafe { ikcp_send(self.kcp, data.as_ptr() as *const _, data.len() as _) };
         if ret < 0 {
             return Err(anyhow::anyhow!("send failed, return: {}", ret).into());
         } else {
@@ -152,7 +152,7 @@ impl Kcp {
 
     pub fn recv(&mut self, buf: &mut BytesMut) -> Result<(), Error> {
         let ret =
-            unsafe { ikcp_recv(self.kcp, buf.as_mut_ptr() as *mut i8, buf.capacity() as i32) };
+            unsafe { ikcp_recv(self.kcp, buf.as_mut_ptr() as *mut _, buf.capacity() as _) };
         if ret < 0 {
             return Err(anyhow::anyhow!("recv failed, return: {}", ret).into());
         } else {
