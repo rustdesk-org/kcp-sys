@@ -18,9 +18,13 @@ fn main() {
     println!("cargo:rerun-if-changed=kcp/ikcp.c");
     println!("cargo:rerun-if-changed=wrapper.h");
 
+    let extra_header_path = std::env::var("KCP_SYS_EXTRA_HEADER_PATH").unwrap_or_default();
+    let extra_header_paths = extra_header_path.split(":").collect::<Vec<_>>();
+
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .clang_args(extra_header_paths.iter().map(|p| format!("-I{}", p)))
         .allowlist_function("ikcp_.*")
         .use_core()
         .generate()
