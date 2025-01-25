@@ -365,6 +365,13 @@ impl KcpConnectionState {
         )
     }
 
+    fn is_local_closed(&self) -> bool {
+        matches!(
+            self.fsm,
+            KcpConnectionFSM::LocalClosed | KcpConnectionFSM::Closed
+        )
+    }
+
     fn is_closed(&self) -> bool {
         matches!(self.fsm, KcpConnectionFSM::Closed)
     }
@@ -480,10 +487,6 @@ impl KcpEndpoint {
             async move {
                 while let Some(packet) = input_receiver.recv().await {
                     tracing::trace!("recv packet: {:?}", packet);
-                    if Self::try_handle_pingpong(&data, &packet, &output_sender).await {
-                        continue;
-                    }
-
                     let conv = ConnId::from(&packet);
                     if packet.header().is_data() && packet.payload().len() > 0 {
                         if let Some(mut conn) = data.conn_map.get_mut(&conv) {
@@ -525,6 +528,14 @@ impl KcpEndpoint {
                         }
                     } else {
                         let state = state.unwrap();
+
+                        if !state.is_closed()
+                            && !state.is_local_closed()
+                            && Self::try_handle_pingpong(&data, &packet, &output_sender).await
+                        {
+                            continue;
+                        }
+
                         let prev_established = state.is_established();
                         let ret = state.handle_packet(&packet);
                         tracing::trace!(?conv, ?state, "handle packet for conn, ret: {:?}", ret);
