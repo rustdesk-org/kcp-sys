@@ -22,6 +22,7 @@ fn main() {
         .header("wrapper.h")
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .allowlist_function("ikcp_.*")
+        .use_core()
         .generate()
         .expect("Unable to generate bindings");
 
