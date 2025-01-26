@@ -405,6 +405,8 @@ impl KcpEndpointData {
     }
 }
 
+pub type KcpConfigFactory = Box<dyn Fn(u32) -> KcpConfig + Send + Sync>;
+
 pub struct KcpEndpoint {
     id: u64,
     data: Arc<KcpEndpointData>,
@@ -417,6 +419,8 @@ pub struct KcpEndpoint {
 
     new_conn_sender: tokio::sync::mpsc::Sender<ConnId>,
     new_conn_receiver: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<ConnId>>>,
+
+    kcp_config_factory: KcpConfigFactory,
 
     tasks: JoinSet<()>,
 }
@@ -446,8 +450,14 @@ impl KcpEndpoint {
             new_conn_sender,
             new_conn_receiver: Arc::new(tokio::sync::Mutex::new(new_conn_receiver)),
 
+            kcp_config_factory: Box::new(|conv| KcpConfig::new_turbo(conv)),
+
             tasks: JoinSet::new(),
         }
+    }
+
+    pub fn set_kcp_config_factory(&mut self, factory: KcpConfigFactory) {
+        self.kcp_config_factory = factory;
     }
 
     async fn try_handle_pingpong(
@@ -460,8 +470,21 @@ impl KcpEndpoint {
         }
 
         if !packet.header().is_pong() {
+            let conn_id = ConnId::from(packet);
+            let need_send_pong = data
+                .state_map
+                .get_mut(&conn_id)
+                .map(|x| !x.is_local_closed())
+                .unwrap_or(false);
+
             let mut out_packet = packet.clone();
-            out_packet.mut_header().set_pong(true);
+            if need_send_pong {
+                out_packet.mut_header().set_pong(true);
+            } else {
+                out_packet.mut_header().set_ping(false);
+                out_packet.mut_header().set_rst(true);
+            };
+
             tracing::trace!("sending pong packet: {:?}", out_packet);
             let ret = output_sender.send(out_packet).await;
             if let Err(e) = ret {
@@ -487,6 +510,10 @@ impl KcpEndpoint {
             async move {
                 while let Some(packet) = input_receiver.recv().await {
                     tracing::trace!("recv packet: {:?}", packet);
+                    if Self::try_handle_pingpong(&data, &packet, &output_sender).await {
+                        continue;
+                    }
+
                     let conv = ConnId::from(&packet);
                     if packet.header().is_data() && packet.payload().len() > 0 {
                         if let Some(mut conn) = data.conn_map.get_mut(&conv) {
@@ -528,14 +555,6 @@ impl KcpEndpoint {
                         }
                     } else {
                         let state = state.unwrap();
-
-                        if !state.is_closed()
-                            && !state.is_local_closed()
-                            && Self::try_handle_pingpong(&data, &packet, &output_sender).await
-                        {
-                            continue;
-                        }
-
                         let prev_established = state.is_established();
                         let ret = state.handle_packet(&packet);
                         tracing::trace!(?conv, ?state, "handle packet for conn, ret: {:?}", ret);

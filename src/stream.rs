@@ -14,6 +14,8 @@ pub struct KcpStream {
     receiver: KcpStreamReceiver,
     conn_id: ConnId,
     conn_data: Bytes,
+
+    partial_recv_buf: Option<BytesMut>,
 }
 
 impl std::fmt::Debug for KcpStream {
@@ -33,6 +35,8 @@ impl KcpStream {
             receiver,
             conn_id,
             conn_data,
+
+            partial_recv_buf: None,
         })
     }
 
@@ -51,15 +55,59 @@ impl AsyncRead for KcpStream {
         cx: &mut Context,
         buf: &mut ReadBuf,
     ) -> Poll<std::io::Result<()>> {
-        let Some(read_buf) = ready!(self.receiver.poll_recv(cx)) else {
-            return Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "stream closed",
-            )));
-        };
+        let mut partial_recved = false;
+        if let Some(partial_recv_buf) = &mut self.partial_recv_buf {
+            assert!(partial_recv_buf.len() > 0);
+            partial_recved = true;
 
-        buf.put_slice(&read_buf);
-        Poll::Ready(Ok(()))
+            let len = std::cmp::min(buf.remaining(), partial_recv_buf.len());
+            buf.put_slice(&partial_recv_buf.split_to(len));
+
+            if partial_recv_buf.is_empty() {
+                self.partial_recv_buf = None;
+            }
+
+            if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+        }
+
+        loop {
+            let recv_ret = self.receiver.poll_recv(cx);
+            match recv_ret {
+                Poll::Ready(Some(mut read_buf)) => {
+                    partial_recved = true;
+
+                    let len = std::cmp::min(buf.remaining(), read_buf.len());
+                    buf.put_slice(&read_buf[..len]);
+
+                    if len < read_buf.len() {
+                        self.partial_recv_buf = Some(read_buf.split_off(len));
+                    }
+
+                    if buf.remaining() == 0 {
+                        return Poll::Ready(Ok(()));
+                    }
+                }
+                Poll::Ready(None) => {
+                    if partial_recved {
+                        return Poll::Ready(Ok(()));
+                    } else {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "stream closed",
+                        )));
+                    }
+                }
+                Poll::Pending => {
+                    if partial_recved {
+                        return Poll::Ready(Ok(()));
+                    } else {
+                        return Poll::Pending;
+                    }
+                }
+            }
+        }
     }
 }
 

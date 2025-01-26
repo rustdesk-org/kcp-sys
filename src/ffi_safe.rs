@@ -151,8 +151,7 @@ impl Kcp {
     }
 
     pub fn recv(&mut self, buf: &mut BytesMut) -> Result<(), Error> {
-        let ret =
-            unsafe { ikcp_recv(self.kcp, buf.as_mut_ptr() as *mut _, buf.capacity() as _) };
+        let ret = unsafe { ikcp_recv(self.kcp, buf.as_mut_ptr() as *mut _, buf.capacity() as _) };
         if ret < 0 {
             return Err(anyhow::anyhow!("recv failed, return: {}", ret).into());
         } else {
@@ -201,6 +200,12 @@ impl Kcp {
             );
             if ret < 0 {
                 return Err(anyhow::anyhow!("nodelay failed, return: {}", ret).into());
+            }
+
+            if let Some(interval) = self.config.interval {
+                if interval > 0 {
+                    (*self.kcp).interval = interval as _;
+                }
             }
         }
 
