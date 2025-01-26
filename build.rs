@@ -19,7 +19,7 @@ fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
 
     let extra_header_path = std::env::var("KCP_SYS_EXTRA_HEADER_PATH").unwrap_or_default();
-    let extra_header_paths = extra_header_path.split(":").collect::<Vec<_>>();
+    let extra_header_paths = extra_header_path.split(":").filter(|s| !s.is_empty()).collect::<Vec<_>>();
 
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
