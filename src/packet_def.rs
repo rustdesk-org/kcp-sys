@@ -1,7 +1,8 @@
 use std::fmt::Formatter;
-
-use bytes::{Bytes, BytesMut};
 use zerocopy::{AsBytes, FromBytes, FromZeroes, LittleEndian, U32};
+
+pub type BytesMut = bytes::BytesMut;
+pub type Bytes = bytes::Bytes;
 
 bitflags::bitflags! {
     #[derive(Debug)]
@@ -188,6 +189,7 @@ impl std::fmt::Debug for KcpPacketHeader {
     }
 }
 
+
 #[derive(Clone)]
 pub struct KcpPacket {
     inner: BytesMut,
@@ -255,5 +257,9 @@ impl KcpPacket {
 
     pub fn inner(self) -> BytesMut {
         self.inner
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
     }
 }
