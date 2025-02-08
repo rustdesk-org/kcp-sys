@@ -465,11 +465,9 @@ impl KcpEndpoint {
         packet: &KcpPacket,
         output_sender: &KcpPakcetSender,
     ) -> bool {
-        if !packet.header().is_ping() {
-            return false;
-        }
+        let hdr = packet.header();
 
-        if !packet.header().is_pong() {
+        if hdr.is_ping() && !hdr.is_pong() {
             let conn_id = ConnId::from(packet);
             let need_send_pong = data
                 .state_map
@@ -490,14 +488,15 @@ impl KcpEndpoint {
             if let Err(e) = ret {
                 tracing::error!(?e, "send pong packet failed");
             }
-        } else {
-            let conv = ConnId::from(packet);
-            if let Some(mut state) = data.state_map.get_mut(&conv) {
-                state.notify_pong();
-            }
         }
 
-        true
+        // all incoming packet should update pong time
+        let conv = ConnId::from(packet);
+        if let Some(mut state) = data.state_map.get_mut(&conv) {
+            state.notify_pong();
+        }
+
+        packet.header().is_ping()
     }
 
     pub async fn run(&mut self) {
