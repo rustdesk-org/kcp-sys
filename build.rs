@@ -1,5 +1,6 @@
 use std::env;
 use std::path::{Path, PathBuf};
+use bindgen::{Builder, RustTarget};
 
 fn main() {
     println!("cargo:rustc-link-lib=kcp");
@@ -23,6 +24,7 @@ fn main() {
 
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
+        .rust_target(RustTarget::Stable_1_77)
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .clang_args(extra_header_paths.iter().map(|p| format!("-I{}", p)))
         .allowlist_function("ikcp_.*")
