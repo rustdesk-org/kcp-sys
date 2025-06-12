@@ -24,7 +24,7 @@ fn main() {
 
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
-        .rust_target(RustTarget::Stable_1_77)
+        .rust_target(RustTarget::Stable_1_73)
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .clang_args(extra_header_paths.iter().map(|p| format!("-I{}", p)))
         .allowlist_function("ikcp_.*")
