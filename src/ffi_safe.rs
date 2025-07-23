@@ -172,7 +172,11 @@ impl Kcp {
     }
 
     fn handle_output_callback(&self, buf: BytesMut) -> Result<(), Error> {
-        (self.output_cb.as_ref().unwrap())(self.config.conv, buf)
+        if let Some(output_cb) = self.output_cb.as_ref() {
+            output_cb(self.config.conv, buf)
+        } else {
+            Err(anyhow::anyhow!("no output callback set").into())
+        }
     }
 
     fn apply_config(&mut self) -> Result<(), Error> {
