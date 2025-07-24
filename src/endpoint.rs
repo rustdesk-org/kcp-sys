@@ -167,26 +167,33 @@ impl KcpConnection {
         self.tasks.spawn(
             async move {
                 while let Some(data) = send_receiver.recv().await {
-                    loop {
-                        let (waitsnd, sndwnd) = {
-                            let kcp = kcp.lock();
-                            (kcp.waitsnd(), kcp.sendwnd())
-                        };
-                        if waitsnd > 2 * sndwnd {
-                            inner
-                                .waiting_new_send_window
-                                .store(true, std::sync::atomic::Ordering::SeqCst);
-                            inner.send_notifier.notified().await;
-                        } else {
+                    let data = data.freeze();
+                    let max_send = kcp.lock().max_chunk_size();
+
+                    for chunk in data.chunks(max_send) {
+                        // flow control wait
+                        loop {
+                            let (waitsnd, sndwnd) = {
+                                let kcp = kcp.lock();
+                                (kcp.waitsnd(), kcp.sendwnd())
+                            };
+                            if waitsnd > 2 * sndwnd {
+                                inner
+                                    .waiting_new_send_window
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                                inner.send_notifier.notified().await;
+                            } else {
+                                break;
+                            }
+                        }
+
+                        if let Err(e) = kcp.lock().send(chunk) {
+                            log::error!("send data failed: {:?}, len: {}", e, chunk.len());
                             break;
                         }
+                        kcp.lock().flush();
+                        inner.update_notifier.notify_one();
                     }
-                    if let Err(e) = kcp.lock().send(data.freeze()) {
-                        tracing::error!(?e, "send data failed");
-                        return;
-                    }
-                    kcp.lock().flush();
-                    inner.update_notifier.notify_one();
                 }
 
                 tracing::debug!(
@@ -233,7 +240,7 @@ impl KcpConnection {
                     }
                     if let Err(e) = kcp.lock().recv(&mut buf) {
                         log::error!("recv data failed: {:?}", e);
-                        return;
+                        continue;
                     }
                     tracing::trace!("recv data ({}): {:?}", buf.len(), buf);
                     assert_ne!(0, buf.len());
@@ -498,7 +505,7 @@ impl KcpEndpoint {
             tracing::trace!("sending pong packet: {:?}", out_packet);
             let ret = output_sender.send(out_packet).await;
             if let Err(e) = ret {
-                log::warn!("send pong packet failed: {:?}", e);
+                tracing::error!(?e, "send pong packet failed");
             }
         }
 
@@ -574,7 +581,7 @@ impl KcpEndpoint {
                     } else {
                         let Some(state) = state else {
                             log::error!("no state for conn, ignore");
-                            return;
+                            continue;
                         };
                         let prev_established = state.is_established();
                         let ret = state.handle_packet(&packet);
@@ -649,7 +656,7 @@ impl KcpEndpoint {
                 for packet in packets {
                     let ret = output_sender.send(packet).await;
                     if let Err(e) = ret {
-                        log::warn!("send ping packet failed: {:?}", e);
+                        tracing::error!(?e, "send ping packet failed");
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
@@ -689,7 +696,6 @@ impl KcpEndpoint {
                     conn_id.fill_packet_header(&mut out_packet);
                     if let Err(e) = output_sender.send(out_packet).await {
                         log::error!("send close packet failed: {:?}, conv: {:?}", e, conn_id);
-                        return;
                     }
                 }
                 Err(e) => {

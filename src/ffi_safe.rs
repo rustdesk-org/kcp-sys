@@ -3,6 +3,8 @@ use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
 
+const MTU_SIZE: i32 = 1200;
+
 #[derive(Debug, Clone, Copy)]
 pub struct KcpConfig {
     pub conv: IUINT32,
@@ -34,7 +36,7 @@ impl KcpConfig {
     pub fn new_turbo(conv: IUINT32) -> Self {
         Self {
             conv,
-            mtu: Some(1200),
+            mtu: Some(MTU_SIZE),
             sndwnd: Some(1024),
             rcvwnd: Some(1024),
             nodelay: Some(1),
@@ -131,7 +133,7 @@ impl Kcp {
         next - current
     }
 
-    pub fn send(&mut self, data: Bytes) -> Result<usize, Error> {
+    pub fn send(&mut self, data: &[u8]) -> Result<usize, Error> {
         let ret = unsafe { ikcp_send(self.kcp, data.as_ptr() as *const _, data.len() as _) };
         if ret < 0 {
             return Err(anyhow::anyhow!("send failed, return: {}", ret).into());
@@ -179,9 +181,22 @@ impl Kcp {
         }
     }
 
+    pub fn max_chunk_size(&self) -> usize {
+        // https://github.com/skywind3000/kcp/blob/f4f3a89cc632647dabdcb146932d2afd5591e62e/ikcp.c#L512
+        // https://github.com/skywind3000/kcp/issues/428
+        const IKCP_WND_RCV: u32 = 128; // kcp uses IKCP_WND_RCV -1 as the max count of mss
+        const MIN_CHUNK_SIZE: usize = 1024;
+        let mss = unsafe { (*self.kcp).mss };
+        let sndwnd = unsafe { (*self.kcp).snd_wnd };
+        let rcvwnd = unsafe { (*self.kcp).rcv_wnd };
+        let max_count = std::cmp::min(IKCP_WND_RCV - 1, std::cmp::min(sndwnd, rcvwnd));
+        let truncate_size = (max_count as usize) * (mss as usize);
+        truncate_size.max(MIN_CHUNK_SIZE)
+    }
+
     fn apply_config(&mut self) -> Result<(), Error> {
         unsafe {
-            let ret = ikcp_setmtu(self.kcp, self.config.mtu.unwrap_or(1200));
+            let ret = ikcp_setmtu(self.kcp, self.config.mtu.unwrap_or(MTU_SIZE));
             if ret < 0 {
                 return Err(anyhow::anyhow!("setmtu failed, return: {}", ret).into());
             }
