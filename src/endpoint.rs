@@ -160,7 +160,7 @@ impl KcpConnection {
         let kcp = self.kcp.clone();
         let inner = self.inner.clone();
         let Some(mut send_receiver) = self.send_receiver.take() else {
-            tracing::error!("send receiver is not set");
+            log::error!("send receiver is not set");
             return;
         };
         let send_close_notifier = self.send_close_notifier.clone();
@@ -213,7 +213,7 @@ impl KcpConnection {
         let inner = self.inner.clone();
         let conn_id = self.conn_id;
         let Some(recv_sender) = self.recv_sender.take() else {
-            tracing::error!("recv sender is not set");
+            log::error!("recv sender is not set");
             return;
         };
         let recv_closed = self.recv_closed.clone();
@@ -232,7 +232,7 @@ impl KcpConnection {
                         buf.reserve(std::cmp::max(peeksize as usize, 4096));
                     }
                     if let Err(e) = kcp.lock().recv(&mut buf) {
-                        tracing::error!(?e, "recv data failed");
+                        log::error!("recv data failed: {:?}", e);
                         return;
                     }
                     tracing::trace!("recv data ({}): {:?}", buf.len(), buf);
@@ -498,7 +498,7 @@ impl KcpEndpoint {
             tracing::trace!("sending pong packet: {:?}", out_packet);
             let ret = output_sender.send(out_packet).await;
             if let Err(e) = ret {
-                tracing::error!(?e, "send pong packet failed");
+                log::warn!("send pong packet failed: {:?}", e);
             }
         }
 
@@ -513,7 +513,7 @@ impl KcpEndpoint {
 
     pub async fn run(&mut self) {
         let Some(mut input_receiver) = self.input_receiver.take() else {
-            tracing::error!("input receiver is not set");
+            log::error!("input receiver is not set");
             return;
         };
         let data = self.data.clone();
@@ -532,7 +532,11 @@ impl KcpEndpoint {
                     if packet.header().is_data() && packet.payload().len() > 0 {
                         if let Some(mut conn) = data.conn_map.get_mut(&conv) {
                             if let Err(e) = conn.handle_input(&packet) {
-                                tracing::error!(?e, ?conv, "handle input on connection failed");
+                                log::warn!(
+                                    "handle input on connection failed: {:?}, conv: {:?}",
+                                    e,
+                                    conv
+                                );
                             } else {
                                 tracing::trace!(?conv, "handle input on connection done");
                             }
@@ -569,7 +573,7 @@ impl KcpEndpoint {
                         }
                     } else {
                         let Some(state) = state else {
-                            tracing::error!("no state for conn, ignore");
+                            log::error!("no state for conn, ignore");
                             return;
                         };
                         let prev_established = state.is_established();
@@ -601,7 +605,7 @@ impl KcpEndpoint {
                         tracing::trace!(?conv, ?out_packet, "sending output packet");
                         let ret = output_sender.send(out_packet).await;
                         if let Err(e) = ret {
-                            tracing::error!(?e, "send output packet failed");
+                            log::warn!("send output packet failed: {:?}", e);
                         }
                     }
                 }
@@ -645,7 +649,7 @@ impl KcpEndpoint {
                 for packet in packets {
                     let ret = output_sender.send(packet).await;
                     if let Err(e) = ret {
-                        tracing::error!(?e, "send ping packet failed");
+                        log::warn!("send ping packet failed: {:?}", e);
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
@@ -684,12 +688,12 @@ impl KcpEndpoint {
                 Ok(_) => {
                     conn_id.fill_packet_header(&mut out_packet);
                     if let Err(e) = output_sender.send(out_packet).await {
-                        tracing::error!(?e, ?conn_id, "send close packet failed");
+                        log::error!("send close packet failed: {:?}, conv: {:?}", e, conn_id);
                         return;
                     }
                 }
                 Err(e) => {
-                    tracing::error!(?e, ?conn_id, "close connection failed");
+                    log::warn!("close connection failed: {:?}, conv: {:?}", e, conn_id);
                 }
             }
 
@@ -721,11 +725,11 @@ impl KcpEndpoint {
     ) -> Option<(KcpStreamSender, KcpStreamReceiver)> {
         let mut conn = self.data.conn_map.get_mut(&conn_id)?;
         let Some(send_sender) = conn.send_sender() else {
-            tracing::error!("send sender is not set");
+            log::error!("send sender is not set");
             return None;
         };
         let Some(recv_receiver) = conn.recv_receiver() else {
-            tracing::error!("recv receiver is not set");
+            log::error!("recv receiver is not set");
             return None;
         };
         Some((send_sender, recv_receiver))
