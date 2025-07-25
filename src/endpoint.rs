@@ -159,28 +159,41 @@ impl KcpConnection {
         // handle packet send
         let kcp = self.kcp.clone();
         let inner = self.inner.clone();
-        let mut send_receiver = self.send_receiver.take().unwrap();
+        let Some(mut send_receiver) = self.send_receiver.take() else {
+            log::error!("send receiver is not set");
+            return;
+        };
         let send_close_notifier = self.send_close_notifier.clone();
         self.tasks.spawn(
             async move {
                 while let Some(data) = send_receiver.recv().await {
-                    loop {
-                        let (waitsnd, sndwnd) = {
-                            let kcp = kcp.lock();
-                            (kcp.waitsnd(), kcp.sendwnd())
-                        };
-                        if waitsnd > 2 * sndwnd {
-                            inner
-                                .waiting_new_send_window
-                                .store(true, std::sync::atomic::Ordering::SeqCst);
-                            inner.send_notifier.notified().await;
-                        } else {
+                    let data = data.freeze();
+                    let max_send = kcp.lock().max_chunk_size();
+
+                    for chunk in data.chunks(max_send) {
+                        // flow control wait
+                        loop {
+                            let (waitsnd, sndwnd) = {
+                                let kcp = kcp.lock();
+                                (kcp.waitsnd(), kcp.sendwnd())
+                            };
+                            if waitsnd > 2 * sndwnd {
+                                inner
+                                    .waiting_new_send_window
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                                inner.send_notifier.notified().await;
+                            } else {
+                                break;
+                            }
+                        }
+
+                        if let Err(e) = kcp.lock().send(chunk) {
+                            log::error!("send data failed: {:?}, len: {}", e, chunk.len());
                             break;
                         }
+                        kcp.lock().flush();
+                        inner.update_notifier.notify_one();
                     }
-                    kcp.lock().send(data.freeze()).unwrap();
-                    kcp.lock().flush();
-                    inner.update_notifier.notify_one();
                 }
 
                 tracing::debug!(
@@ -206,7 +219,10 @@ impl KcpConnection {
         let kcp = self.kcp.clone();
         let inner = self.inner.clone();
         let conn_id = self.conn_id;
-        let recv_sender = self.recv_sender.take().unwrap();
+        let Some(recv_sender) = self.recv_sender.take() else {
+            log::error!("recv sender is not set");
+            return;
+        };
         let recv_closed = self.recv_closed.clone();
         self.tasks.spawn(
             async move {
@@ -222,7 +238,10 @@ impl KcpConnection {
                     if buf.capacity() < peeksize as usize {
                         buf.reserve(std::cmp::max(peeksize as usize, 4096));
                     }
-                    kcp.lock().recv(&mut buf).unwrap();
+                    if let Err(e) = kcp.lock().recv(&mut buf) {
+                        log::error!("recv data failed: {:?}", e);
+                        continue;
+                    }
                     tracing::trace!("recv data ({}): {:?}", buf.len(), buf);
                     assert_ne!(0, buf.len());
                     let send_ret = recv_sender.send(buf.split()).await;
@@ -246,12 +265,12 @@ impl KcpConnection {
         Ok(())
     }
 
-    fn send_sender(&mut self) -> KcpStreamSender {
-        self.send_sender.take().unwrap()
+    fn send_sender(&mut self) -> Option<KcpStreamSender> {
+        self.send_sender.take()
     }
 
-    fn recv_receiver(&mut self) -> KcpStreamReceiver {
-        self.recv_receiver.take().unwrap()
+    fn recv_receiver(&mut self) -> Option<KcpStreamReceiver> {
+        self.recv_receiver.take()
     }
 
     fn send_close_notifier(&self) -> Arc<Notify> {
@@ -500,7 +519,10 @@ impl KcpEndpoint {
     }
 
     pub async fn run(&mut self) {
-        let mut input_receiver = self.input_receiver.take().unwrap();
+        let Some(mut input_receiver) = self.input_receiver.take() else {
+            log::error!("input receiver is not set");
+            return;
+        };
         let data = self.data.clone();
         let output_sender = self.output_sender.clone();
         let new_conn_sender = self.new_conn_sender.clone();
@@ -517,7 +539,11 @@ impl KcpEndpoint {
                     if packet.header().is_data() && packet.payload().len() > 0 {
                         if let Some(mut conn) = data.conn_map.get_mut(&conv) {
                             if let Err(e) = conn.handle_input(&packet) {
-                                tracing::error!(?e, ?conv, "handle input on connection failed");
+                                log::warn!(
+                                    "handle input on connection failed: {:?}, conv: {:?}",
+                                    e,
+                                    conv
+                                );
                             } else {
                                 tracing::trace!(?conv, "handle input on connection done");
                             }
@@ -553,12 +579,15 @@ impl KcpEndpoint {
                             data.state_map.insert(conv, conn_state);
                         }
                     } else {
-                        let state = state.unwrap();
+                        let Some(state) = state else {
+                            log::error!("no state for conn, ignore");
+                            continue;
+                        };
                         let prev_established = state.is_established();
                         let ret = state.handle_packet(&packet);
                         tracing::trace!(?conv, ?state, "handle packet for conn, ret: {:?}", ret);
-                        if ret.is_ok() {
-                            out_packet = ret.unwrap();
+                        if let Ok(ret) = ret {
+                            out_packet = ret;
                         }
 
                         if !prev_established && state.is_established() {
@@ -583,7 +612,7 @@ impl KcpEndpoint {
                         tracing::trace!(?conv, ?out_packet, "sending output packet");
                         let ret = output_sender.send(out_packet).await;
                         if let Err(e) = ret {
-                            tracing::error!(?e, "send output packet failed");
+                            log::warn!("send output packet failed: {:?}", e);
                         }
                     }
                 }
@@ -665,10 +694,12 @@ impl KcpEndpoint {
             match close_ret {
                 Ok(_) => {
                     conn_id.fill_packet_header(&mut out_packet);
-                    output_sender.send(out_packet).await.unwrap();
+                    if let Err(e) = output_sender.send(out_packet).await {
+                        log::error!("send close packet failed: {:?}, conv: {:?}", e, conn_id);
+                    }
                 }
                 Err(e) => {
-                    tracing::error!(?e, ?conn_id, "close connection failed");
+                    log::warn!("close connection failed: {:?}, conv: {:?}", e, conn_id);
                 }
             }
 
@@ -699,7 +730,15 @@ impl KcpEndpoint {
         conn_id: ConnId,
     ) -> Option<(KcpStreamSender, KcpStreamReceiver)> {
         let mut conn = self.data.conn_map.get_mut(&conn_id)?;
-        Some((conn.send_sender(), conn.recv_receiver()))
+        let Some(send_sender) = conn.send_sender() else {
+            log::error!("send sender is not set");
+            return None;
+        };
+        let Some(recv_receiver) = conn.recv_receiver() else {
+            log::error!("recv receiver is not set");
+            return None;
+        };
+        Some((send_sender, recv_receiver))
     }
 
     pub fn conn_data(&self, conn_id: &ConnId) -> Option<Bytes> {
