@@ -51,7 +51,7 @@ pub struct Kcp {
     kcp: *mut ikcpcb,
     config: KcpConfig,
     now: Instant,
-    output_cb: Option<Box<dyn Fn(u32, BytesMut) -> Result<(), Error>>>,
+    output_cb: Option<OutputCb>,
 
     _marker: core::marker::PhantomData<(*mut u8, core::marker::PhantomPinned)>,
 }
@@ -102,7 +102,7 @@ impl Kcp {
 
             ret.apply_config()?;
 
-            return Ok(ret);
+            Ok(ret)
         }
     }
 
@@ -113,9 +113,9 @@ impl Kcp {
     pub fn handle_input(&mut self, data: &[u8]) -> Result<(), Error> {
         let ret = unsafe { ikcp_input(self.kcp, data.as_ptr() as *const _, data.len() as _) };
         if ret < 0 {
-            return Err(anyhow::anyhow!("input failed, return: {}", ret).into());
+            Err(anyhow::anyhow!("input failed, return: {}", ret).into())
         } else {
-            return Ok(());
+            Ok(())
         }
     }
 
@@ -134,9 +134,9 @@ impl Kcp {
     pub fn send(&mut self, data: Bytes) -> Result<usize, Error> {
         let ret = unsafe { ikcp_send(self.kcp, data.as_ptr() as *const _, data.len() as _) };
         if ret < 0 {
-            return Err(anyhow::anyhow!("send failed, return: {}", ret).into());
+            Err(anyhow::anyhow!("send failed, return: {}", ret).into())
         } else {
-            return Ok(ret as usize);
+            Ok(ret as usize)
         }
     }
 
@@ -153,12 +153,12 @@ impl Kcp {
     pub fn recv(&mut self, buf: &mut BytesMut) -> Result<(), Error> {
         let ret = unsafe { ikcp_recv(self.kcp, buf.as_mut_ptr() as *mut _, buf.capacity() as _) };
         if ret < 0 {
-            return Err(anyhow::anyhow!("recv failed, return: {}", ret).into());
+            Err(anyhow::anyhow!("recv failed, return: {}", ret).into())
         } else {
             unsafe {
                 buf.set_len(ret as usize);
             }
-            return Ok(());
+            Ok(())
         }
     }
 
@@ -209,7 +209,7 @@ impl Kcp {
             }
         }
 
-        return Ok(());
+        Ok(())
     }
 }
 

@@ -1,26 +1,178 @@
-name: Rust
+name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  # ──────────────────────────────────────────────
+  # Lint: rustfmt + clippy
+  # ──────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-    runs-on: ubuntu-latest
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+
+  # ──────────────────────────────────────────────
+  # Native build + test matrix
+  # 6 runners × 2 profiles = 12 jobs
+  # ──────────────────────────────────────────────
+  build:
+    name: ${{ matrix.name }} (${{ matrix.profile }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x64
+          - name: Linux x64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            profile: debug
+          - name: Linux x64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            profile: release
+
+          # Linux arm64
+          - name: Linux arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            profile: debug
+          - name: Linux arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            profile: release
+
+          # Windows x64
+          - name: Windows x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            profile: debug
+          - name: Windows x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            profile: release
+
+          # Windows arm64
+          - name: Windows arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            profile: debug
+          - name: Windows arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            profile: release
+
+          # macOS x64 (Intel)
+          - name: macOS x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            profile: debug
+          - name: macOS x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            profile: release
+
+          # macOS arm64 (Apple Silicon)
+          - name: macOS arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            profile: debug
+          - name: macOS arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            profile: release
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-      with:
-        submodules: recursive
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-${{ matrix.profile }}
+
+      # Linux: install libclang for bindgen
+      - name: Install libclang (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+
+      - name: Build
+        run: cargo build --target ${{ matrix.target }} --verbose ${{ matrix.profile == 'release' && '--release' || '' }}
+
+      - name: Test
+        run: cargo test --target ${{ matrix.target }} --verbose ${{ matrix.profile == 'release' && '--release' || '' }}
+
+      - name: Build KCP native test
+        run: |
+          cmake -S kcp -B kcp/build -DBUILD_TESTING=ON
+          cmake --build kcp/build --target kcp_test
+
+  # ──────────────────────────────────────────────
+  # Cross-compilation via zigbuild (musl targets)
+  # 2 targets × 2 profiles = 4 jobs
+  # ──────────────────────────────────────────────
+  cross:
+    name: Cross ${{ matrix.target }} (${{ matrix.profile }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-musl
+            profile: debug
+          - target: aarch64-unknown-linux-musl
+            profile: release
+          - target: x86_64-unknown-linux-musl
+            profile: debug
+          - target: x86_64-unknown-linux-musl
+            profile: release
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: mlugg/setup-zig@v2
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cross-${{ matrix.target }}-${{ matrix.profile }}
+
+      - name: Install libclang and cargo-zigbuild
+        run: |
+          sudo apt-get update && sudo apt-get install -y libclang-dev
+          cargo install cargo-zigbuild
+
+      - name: Build (zigbuild)
+        run: cargo zigbuild --target ${{ matrix.target }} --verbose ${{ matrix.profile == 'release' && '--release' || '' }}

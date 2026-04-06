@@ -189,7 +189,6 @@ impl std::fmt::Debug for KcpPacketHeader {
     }
 }
 
-
 #[derive(Clone)]
 pub struct KcpPacket {
     inner: BytesMut,
@@ -216,15 +215,15 @@ impl std::fmt::Debug for KcpPacket {
     }
 }
 
-impl Into<BytesMut> for KcpPacket {
-    fn into(self) -> BytesMut {
-        self.inner
+impl From<KcpPacket> for BytesMut {
+    fn from(val: KcpPacket) -> Self {
+        val.inner
     }
 }
 
-impl Into<Bytes> for KcpPacket {
-    fn into(self) -> Bytes {
-        self.inner.freeze()
+impl From<KcpPacket> for Bytes {
+    fn from(val: KcpPacket) -> Self {
+        val.inner.freeze()
     }
 }
 
@@ -261,5 +260,9 @@ impl KcpPacket {
 
     pub fn len(&self) -> usize {
         self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
     }
 }

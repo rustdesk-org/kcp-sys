@@ -226,7 +226,7 @@ impl KcpConnection {
                     tracing::trace!("recv data ({}): {:?}", buf.len(), buf);
                     assert_ne!(0, buf.len());
                     let send_ret = recv_sender.send(buf.split()).await;
-                    if let Err(_) = send_ret {
+                    if send_ret.is_err() {
                         break;
                     }
                 }
@@ -341,7 +341,7 @@ impl KcpConnectionState {
     fn handle_packet(&mut self, packet: &KcpPacket) -> Result<Option<KcpPacket>, Error> {
         self.notify_pong();
         let mut out_packet = None;
-        let old_state = self.fsm.clone();
+        let old_state = self.fsm;
         let _ = self.fsm.handle_packet(packet, &mut out_packet);
         if old_state != self.fsm {
             self.notify.notify_one();
@@ -431,6 +431,12 @@ impl std::fmt::Debug for KcpEndpoint {
     }
 }
 
+impl Default for KcpEndpoint {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KcpEndpoint {
     pub fn new() -> Self {
         let (input_sender, input_receiver) = tokio::sync::mpsc::channel(1024);
@@ -450,7 +456,7 @@ impl KcpEndpoint {
             new_conn_sender,
             new_conn_receiver: Arc::new(tokio::sync::Mutex::new(new_conn_receiver)),
 
-            kcp_config_factory: Box::new(|conv| KcpConfig::new_turbo(conv)),
+            kcp_config_factory: Box::new(KcpConfig::new_turbo),
 
             tasks: JoinSet::new(),
         }
@@ -514,7 +520,7 @@ impl KcpEndpoint {
                     }
 
                     let conv = ConnId::from(&packet);
-                    if packet.header().is_data() && packet.payload().len() > 0 {
+                    if packet.header().is_data() && !packet.payload().is_empty() {
                         if let Some(mut conn) = data.conn_map.get_mut(&conv) {
                             if let Err(e) = conn.handle_input(&packet) {
                                 tracing::error!(?e, ?conv, "handle input on connection failed");
@@ -533,32 +539,12 @@ impl KcpEndpoint {
                     let mut state_ref = data.state_map.get_mut(&conv);
                     let state = state_ref.as_deref_mut();
                     let mut out_packet: Option<KcpPacket> = None;
-                    if state.is_none() {
-                        if packet.header().is_rst() {
-                            tracing::debug!(?conv, "reset packet for conn, but no state");
-                            continue;
-                        }
-                        let mut tmp_fsm = KcpConnectionFSM::listen();
-                        let res = tmp_fsm.handle_packet(&packet, &mut out_packet);
-                        tracing::trace!(
-                            ?conv,
-                            ?state,
-                            ?out_packet,
-                            "handle first packet for conn, ret: {:?}",
-                            res
-                        );
-                        if res.is_ok() {
-                            let mut conn_state = KcpConnectionState::new(tmp_fsm);
-                            conn_state.set_data(packet.payload().to_vec().into());
-                            data.state_map.insert(conv, conn_state);
-                        }
-                    } else {
-                        let state = state.unwrap();
+                    if let Some(state) = state {
                         let prev_established = state.is_established();
                         let ret = state.handle_packet(&packet);
                         tracing::trace!(?conv, ?state, "handle packet for conn, ret: {:?}", ret);
-                        if ret.is_ok() {
-                            out_packet = ret.unwrap();
+                        if let Ok(pkt) = ret {
+                            out_packet = pkt;
                         }
 
                         if !prev_established && state.is_established() {
@@ -567,13 +553,33 @@ impl KcpEndpoint {
 
                         if state.is_peer_closed() {
                             tracing::debug!(?conv, "peer half closed, close recv");
-                            data.conn_map.get_mut(&conv).map(|conn| conn.close_recv());
+                            if let Some(conn) = data.conn_map.get_mut(&conv) {
+                                conn.close_recv()
+                            }
                         }
 
                         if state.is_closed() {
                             // state map will be cleaned by periodic task
                             tracing::debug!(?conv, "connection closed, remove state");
                             data.conn_map.remove(&conv);
+                        }
+                    } else {
+                        if packet.header().is_rst() {
+                            tracing::debug!(?conv, "reset packet for conn, but no state");
+                            continue;
+                        }
+                        let mut tmp_fsm = KcpConnectionFSM::listen();
+                        let res = tmp_fsm.handle_packet(&packet, &mut out_packet);
+                        tracing::trace!(
+                            ?conv,
+                            ?out_packet,
+                            "handle first packet for conn, ret: {:?}",
+                            res
+                        );
+                        if res.is_ok() {
+                            let mut conn_state = KcpConnectionState::new(tmp_fsm);
+                            conn_state.set_data(packet.payload().to_vec().into());
+                            data.state_map.insert(conv, conn_state);
                         }
                     }
 
@@ -661,7 +667,7 @@ impl KcpEndpoint {
             };
 
             let close_ret = state.fsm.close(&mut out_packet);
-            let cur_state = state.fsm.clone();
+            let cur_state = state.fsm;
             let is_closed = state.is_closed();
             drop(state);
             match close_ret {

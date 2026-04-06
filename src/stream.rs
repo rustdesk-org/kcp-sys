@@ -57,7 +57,7 @@ impl AsyncRead for KcpStream {
     ) -> Poll<std::io::Result<()>> {
         let mut partial_recved = false;
         if let Some(partial_recv_buf) = &mut self.partial_recv_buf {
-            assert!(partial_recv_buf.len() > 0);
+            assert!(!partial_recv_buf.is_empty());
             partial_recved = true;
 
             let len = std::cmp::min(buf.remaining(), partial_recv_buf.len());
