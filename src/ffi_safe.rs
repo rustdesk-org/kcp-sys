@@ -110,6 +110,35 @@ impl Kcp {
         self.output_cb = Some(output_cb);
     }
 
+    /// Installs a KCP 2.0 congestion control implementation.
+    ///
+    /// # Safety
+    ///
+    /// KCP stores the provided operations pointer and calls it from C. The caller must ensure the
+    /// `IKCPOPS` value outlives every `Kcp` using it, and that its callbacks preserve KCP's aliasing
+    /// and thread-safety requirements.
+    pub unsafe fn set_congestion_control(
+        &mut self,
+        ops: Option<&'static IKCPOPS>,
+    ) -> Result<(), Error> {
+        let ops = ops.map_or(std::ptr::null(), |ops| ops as *const IKCPOPS);
+        let ret = unsafe { ikcp_setcc(self.kcp, ops) };
+        if ret < 0 {
+            Err(anyhow::anyhow!("setcc failed, return: {}", ret).into())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn reset_congestion_control(&mut self) -> Result<(), Error> {
+        let ret = unsafe { ikcp_setcc(self.kcp, std::ptr::null()) };
+        if ret < 0 {
+            Err(anyhow::anyhow!("reset setcc failed, return: {}", ret).into())
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn handle_input(&mut self, data: &[u8]) -> Result<(), Error> {
         let ret = unsafe { ikcp_input(self.kcp, data.as_ptr() as *const _, data.len() as _) };
         if ret < 0 {
@@ -218,5 +247,17 @@ impl Drop for Kcp {
         unsafe {
             ikcp_release(self.kcp);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_congestion_control_uses_builtin_algorithm() {
+        let mut kcp = Kcp::new(KcpConfig::new(1)).unwrap();
+
+        kcp.reset_congestion_control().unwrap();
     }
 }

@@ -129,6 +129,11 @@ jobs:
       - name: Test
         run: cargo test --target ${{ matrix.target }} --verbose ${{ matrix.profile == 'release' && '--release' || '' }}
 
+      - name: Install CMake 4
+        uses: step-security/get-cmake@v4
+        with:
+          cmakeVersion: "^4.0.0"
+
       - name: Build KCP native test
         run: |
           cmake -S kcp -B kcp/build -DBUILD_TESTING=ON

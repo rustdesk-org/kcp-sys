@@ -1,4 +1,4 @@
-mod ffi;
+pub mod ffi;
 mod state;
 
 pub mod endpoint;
