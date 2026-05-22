@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 
 fn zig_target(target: &str) -> String {
     let mut parts = target.split('-');
-    let arch = parts.next().unwrap_or(target);
+    let arch = clang_arch(parts.next().unwrap_or(target));
     let _vendor = parts.next();
     let rest = parts.collect::<Vec<_>>();
 
@@ -15,17 +15,46 @@ fn zig_target(target: &str) -> String {
     }
 }
 
+fn clang_arch(arch: &str) -> &str {
+    match arch {
+        "riscv64gc" => "riscv64",
+        _ => arch,
+    }
+}
+
+fn clang_target(target: &str) -> String {
+    let mut parts = target.split('-');
+    let arch = clang_arch(parts.next().unwrap_or(target));
+    let rest = parts.collect::<Vec<_>>();
+
+    if rest.is_empty() {
+        arch.to_owned()
+    } else {
+        format!("{arch}-{}", rest.join("-"))
+    }
+}
+
+fn clang_target_args(target: &str) -> Vec<String> {
+    let mut args = vec![format!("--target={}", clang_target(target))];
+    if target.starts_with("riscv64gc-") {
+        args.push("-march=rv64gc".to_owned());
+    }
+    args
+}
+
 fn zig_include_dirs(target: &str) -> Option<Vec<String>> {
+    let args = [
+        "cc".to_owned(),
+        format!("--target={}", zig_target(target)),
+        "-E".to_owned(),
+        "-x".to_owned(),
+        "c".to_owned(),
+        "-".to_owned(),
+        "-v".to_owned(),
+    ];
+
     let output = Command::new("zig")
-        .args([
-            "cc",
-            &format!("--target={}", zig_target(target)),
-            "-E",
-            "-x",
-            "c",
-            "-",
-            "-v",
-        ])
+        .args(args)
         .stdin(Stdio::null())
         .output()
         .ok()?;
@@ -79,7 +108,7 @@ fn generate_bindings(target: &str) {
     let host = env::var("HOST").unwrap();
     if target != host {
         if is_zigbuild(target) {
-            bindings = bindings.clang_arg(format!("--target={}", zig_target(target)));
+            bindings = bindings.clang_args(clang_target_args(target));
 
             if let Some(include_dirs) = zig_include_dirs(target) {
                 for include_dir in include_dirs {
@@ -87,7 +116,7 @@ fn generate_bindings(target: &str) {
                 }
             }
         } else {
-            bindings = bindings.clang_arg(format!("--target={target}"));
+            bindings = bindings.clang_args(clang_target_args(target));
         }
     }
 
