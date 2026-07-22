@@ -366,12 +366,19 @@ impl KcpConnectionState {
         self.notify_pong();
         let mut out_packet = None;
         let old_state = self.fsm;
-        let _ = self.fsm.handle_packet(packet, &mut out_packet);
+        let res = self.fsm.handle_packet(packet, &mut out_packet);
         if old_state != self.fsm {
             self.notify.notify_one();
             return Ok(out_packet);
         }
-        Ok(None)
+        // State unchanged: forward a response only when the FSM produced one on success
+        // (an idempotent handshake retransmit, e.g. a re-sent SYN-ACK). Error-triggered
+        // RSTs are suppressed here so a stray or duplicated steady-state packet cannot tear
+        // down a healthy connection.
+        match res {
+            Ok(()) => Ok(out_packet),
+            Err(_) => Ok(None),
+        }
     }
 
     fn notify(&self) -> Arc<Notify> {
@@ -789,12 +796,36 @@ impl KcpEndpoint {
         conn_id.fill_packet_header(&mut out_packet);
 
         tracing::trace!(?conn_id, "connect packet: {:?}", out_packet);
-        self.output_sender
-            .send(out_packet)
-            .await
-            .with_context(|| "send connect packet failed")?;
 
-        if timeout(timeout_dur, notify.notified()).await.is_err() {
+        // Retransmit the SYN until the handshake advances or the overall timeout elapses.
+        // KCP's connect packet is a single datagram; right after UDP hole punching the first
+        // one (or the peer's SYN-ACK) is easily lost, and without retransmission that single
+        // loss would sink the entire transport. The peer treats duplicate SYNs idempotently.
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        let deadline = tokio::time::Instant::now() + timeout_dur;
+        let mut interval = std::time::Duration::from_millis(250);
+        const MAX_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
+        let mut notified_ok = false;
+        loop {
+            self.output_sender
+                .send(out_packet.clone())
+                .await
+                .with_context(|| "send connect packet failed")?;
+
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let wait = std::cmp::min(interval, deadline - now);
+            if timeout(wait, &mut notified).await.is_ok() {
+                notified_ok = true;
+                break;
+            }
+            interval = std::cmp::min(interval.mul_f64(1.5), MAX_INTERVAL);
+        }
+
+        if !notified_ok {
             self.data.state_map.remove(&conn_id);
             return Err(Error::ConnectTimeout);
         }
@@ -878,6 +909,82 @@ mod tests {
         });
 
         (client_endpoint, server_endpoint, t)
+    }
+
+    // Same wiring as prepare_test, but drops the first `client_drop` packets on the
+    // client->server path and the first `server_drop` packets on the server->client path,
+    // simulating datagram loss right after hole punching.
+    async fn prepare_test_lossy(
+        client_drop: usize,
+        server_drop: usize,
+    ) -> (KcpEndpoint, KcpEndpoint, JoinSet<()>) {
+        let mut client_endpoint = KcpEndpoint::new();
+        let mut server_endpoint = KcpEndpoint::new();
+        let mut t = JoinSet::new();
+
+        client_endpoint.run().await;
+        server_endpoint.run().await;
+
+        let client_input_sender = client_endpoint.input_sender();
+        let mut server_output_receiver = server_endpoint.output_receiver().unwrap();
+        t.spawn(async move {
+            let mut seen = 0usize;
+            while let Some(packet) = server_output_receiver.recv().await {
+                seen += 1;
+                if seen <= server_drop {
+                    continue;
+                }
+                let _ = client_input_sender.send(packet).await;
+            }
+        });
+
+        let server_input_sender = server_endpoint.input_sender();
+        let mut client_output_receiver = client_endpoint.output_receiver().unwrap();
+        t.spawn(async move {
+            let mut seen = 0usize;
+            while let Some(packet) = client_output_receiver.recv().await {
+                seen += 1;
+                if seen <= client_drop {
+                    continue;
+                }
+                let _ = server_input_sender.send(packet).await;
+            }
+        });
+
+        (client_endpoint, server_endpoint, t)
+    }
+
+    #[tokio::test]
+    async fn test_kcp_connect_with_handshake_loss() {
+        // Drop the client's first SYN and the server's first SYN-ACK. Without SYN
+        // retransmission plus idempotent SYN-ACK handling, this connect would hang until
+        // the timeout and fail.
+        let (client_endpoint, server_endpoint, t) = prepare_test_lossy(1, 1).await;
+
+        let (connect_ret, accept_ret) = tokio::join!(
+            client_endpoint.connect(std::time::Duration::from_secs(5), 1, 3, Bytes::from("conn")),
+            server_endpoint.accept()
+        );
+
+        let conv = connect_ret.expect("connect should recover from handshake loss");
+        assert_eq!(
+            conv,
+            accept_ret.expect("accept should recover from handshake loss")
+        );
+
+        // Data must still flow over the recovered handshake.
+        let (client_sender, _client_receiver) =
+            client_endpoint.conn_sender_receiver(conv).unwrap();
+        let (_server_sender, mut server_receiver) =
+            server_endpoint.conn_sender_receiver(conv).unwrap();
+
+        client_sender.send(BytesMut::from("hello")).await.unwrap();
+        let data = server_receiver.recv().await.unwrap();
+        assert_eq!("hello", String::from_utf8_lossy(&data));
+
+        drop(client_endpoint);
+        drop(server_endpoint);
+        t.join_all().await;
     }
 
     #[tokio::test]

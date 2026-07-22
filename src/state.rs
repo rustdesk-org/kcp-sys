@@ -99,6 +99,15 @@ impl KcpConnectionFSM {
                 if Self::check_packet_flag(packet, false, true, false, false, true) {
                     *self = KcpConnectionFSM::Established;
                     Ok(())
+                } else if Self::check_packet_flag(packet, true, false, false, false, false) {
+                    // Duplicate SYN: the peer retransmitted its connect packet because our
+                    // SYN-ACK (or its follow-up ACK) was lost. Re-emit the SYN-ACK idempotently
+                    // and stay in SynReceived so a single dropped datagram after hole punching
+                    // does not sink the whole connection.
+                    p.set_syn(true);
+                    p.set_ack(true);
+                    out_packet.replace(p);
+                    Ok(())
                 } else if packet.has_rst() {
                     *self = KcpConnectionFSM::Closed;
                     Err(Error::InvalidState)
@@ -128,6 +137,14 @@ impl KcpConnectionFSM {
             }
             KcpConnectionFSM::Established => {
                 if Self::check_packet_flag(packet, false, true, false, false, true) {
+                    Ok(())
+                } else if Self::check_packet_flag(packet, true, true, false, false, false) {
+                    // Peer retransmitted its SYN-ACK: it has not yet seen our ACK+data, so it is
+                    // still in SynReceived. Re-emit the ACK+data instead of treating the stray
+                    // handshake packet as a protocol error (which would RST a healthy link).
+                    p.set_ack(true);
+                    p.set_data(true);
+                    out_packet.replace(p);
                     Ok(())
                 } else if packet.has_rst() {
                     *self = KcpConnectionFSM::Closed;
