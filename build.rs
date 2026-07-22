@@ -99,6 +99,9 @@ fn generate_bindings(target: &str) {
 
     let mut bindings = bindgen::Builder::default()
         .header("wrapper.h")
+        // Keep generated bindings compatible with the oldest toolchain used by
+        // RustDesk CI builders.
+        .rust_target("1.73".parse().expect("invalid bindgen rust target"))
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .allowlist_function("ikcp_.*")
         .use_core();

@@ -56,19 +56,22 @@ impl AsyncRead for KcpStream {
         buf: &mut ReadBuf,
     ) -> Poll<std::io::Result<()>> {
         let mut partial_recved = false;
-        if let Some(partial_recv_buf) = &mut self.partial_recv_buf {
-            assert!(!partial_recv_buf.is_empty());
-            partial_recved = true;
+        if let Some(mut partial_recv_buf) = self.partial_recv_buf.take() {
+            // An empty leftover buffer (should not happen) is treated as absent instead
+            // of asserted on, so a broken invariant cannot abort the process.
+            if !partial_recv_buf.is_empty() {
+                partial_recved = true;
 
-            let len = std::cmp::min(buf.remaining(), partial_recv_buf.len());
-            buf.put_slice(&partial_recv_buf.split_to(len));
+                let len = std::cmp::min(buf.remaining(), partial_recv_buf.len());
+                buf.put_slice(&partial_recv_buf.split_to(len));
 
-            if partial_recv_buf.is_empty() {
-                self.partial_recv_buf = None;
-            }
+                if !partial_recv_buf.is_empty() {
+                    self.partial_recv_buf = Some(partial_recv_buf);
+                }
 
-            if buf.remaining() == 0 {
-                return Poll::Ready(Ok(()));
+                if buf.remaining() == 0 {
+                    return Poll::Ready(Ok(()));
+                }
             }
         }
 

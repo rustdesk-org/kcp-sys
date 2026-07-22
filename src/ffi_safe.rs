@@ -1,7 +1,7 @@
 use crate::{error::Error, ffi::*};
 use std::time::Instant;
 
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 
 const MTU_SIZE: i32 = 1200;
 
@@ -68,7 +68,13 @@ unsafe extern "C" fn ikcp_output(
 ) -> i32 {
     // convert this to KcpConnection
     let kcp_connection = &mut *(this as *mut Kcp);
-    assert_eq!(kcp_connection.kcp, kcp);
+    debug_assert_eq!(kcp_connection.kcp, kcp);
+    if kcp_connection.kcp != kcp {
+        // Defensive: a mismatched callback context means the packet cannot be routed;
+        // drop it instead of aborting the process (panic = abort in release builds).
+        log::error!("kcp output callback context mismatch");
+        return 0;
+    }
 
     let buf = BytesMut::from(std::slice::from_raw_parts(buf as *const u8, len as usize));
 

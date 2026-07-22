@@ -229,13 +229,13 @@ impl KcpConnection {
                 let mut buf = BytesMut::new();
                 while !recv_closed.load(std::sync::atomic::Ordering::Relaxed) {
                     let peeksize = kcp.lock().peeksize();
-                    if peeksize <= 0 {
+                    if peeksize < 0 {
                         tracing::trace!("recv nothing, wait for next update");
                         inner.recv_notifier.notified().await;
                         continue;
                     };
 
-                    if buf.capacity() < peeksize as usize {
+                    if buf.capacity() < std::cmp::max(peeksize as usize, 1) {
                         buf.reserve(std::cmp::max(peeksize as usize, 4096));
                     }
                     if let Err(e) = kcp.lock().recv(&mut buf) {
@@ -243,7 +243,12 @@ impl KcpConnection {
                         continue;
                     }
                     tracing::trace!("recv data ({}): {:?}", buf.len(), buf);
-                    assert_ne!(0, buf.len());
+                    if buf.is_empty() {
+                        // A zero-length segment (only produced by crafted input) must be
+                        // drained, not asserted on: leaving it queued would wedge the
+                        // stream, and panicking would abort the whole process.
+                        continue;
+                    }
                     let send_ret = recv_sender.send(buf.split()).await;
                     if send_ret.is_err() {
                         break;
@@ -511,7 +516,7 @@ impl KcpEndpoint {
             tracing::trace!("sending pong packet: {:?}", out_packet);
             let ret = output_sender.send(out_packet).await;
             if let Err(e) = ret {
-                tracing::error!(?e, "send pong packet failed");
+                log::error!("send pong packet failed: {:?}", e);
             }
         }
 
@@ -661,7 +666,7 @@ impl KcpEndpoint {
                 for packet in packets {
                     let ret = output_sender.send(packet).await;
                     if let Err(e) = ret {
-                        tracing::error!(?e, "send ping packet failed");
+                        log::error!("send ping packet failed: {:?}", e);
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }

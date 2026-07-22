@@ -201,7 +201,13 @@ impl Default for KcpPacket {
 }
 
 impl From<BytesMut> for KcpPacket {
-    fn from(inner: BytesMut) -> Self {
+    fn from(mut inner: BytesMut) -> Self {
+        // Never construct a packet shorter than its header: header()/mut_header()/payload()
+        // parse the fixed-size prefix and would panic on a truncated datagram.
+        let header_len = std::mem::size_of::<KcpPacketHeader>();
+        if inner.len() < header_len {
+            inner.resize(header_len, 0);
+        }
         Self { inner }
     }
 }
