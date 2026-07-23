@@ -521,10 +521,13 @@ impl KcpEndpoint {
 
         if hdr.is_ping() && !hdr.is_pong() {
             let conn_id = ConnId::from(packet);
+            // Answer pings until the connection is FULLY closed: LocalClosed only shut our
+            // send side, our receive side still expects data, and replying RST here would
+            // make the peer tear down a half-open connection that is still delivering.
             let need_send_pong = data
                 .state_map
                 .get_mut(&conn_id)
-                .map(|x| !x.is_local_closed())
+                .map(|x| !x.is_closed())
                 .unwrap_or(false);
 
             let mut out_packet = packet.clone();
@@ -612,8 +615,15 @@ impl KcpEndpoint {
                         }
 
                         if state.is_closed() {
-                            // state map will be cleaned by periodic task
-                            tracing::debug!(?conv, "connection closed, remove state");
+                            // state map will be cleaned by periodic task.
+                            // Log the close cause at info: session-death reasons are the
+                            // first thing needed when users report drops.
+                            log::info!(
+                                "kcp conn closed by peer packet (rst: {}, fin: {}), conv: {:?}",
+                                packet.header().is_rst(),
+                                packet.header().is_fin(),
+                                conv
+                            );
                             data.conn_map.remove(&conv);
                         }
                     } else {
@@ -654,8 +664,19 @@ impl KcpEndpoint {
         let data = self.data.clone();
         self.tasks.spawn(async move {
             loop {
-                data.state_map.retain(|_, state| {
-                    !matches!(state.fsm, KcpConnectionFSM::Closed) && !state.is_pong_timeout()
+                data.state_map.retain(|conn_id, state| {
+                    let closed = matches!(state.fsm, KcpConnectionFSM::Closed);
+                    let timed_out = state.is_pong_timeout();
+                    if timed_out && !closed {
+                        // A silent reap was indistinguishable from every other way a
+                        // session can end; name the reason for field diagnosis.
+                        log::info!(
+                            "kcp conn reaped by pong timeout ({:?} since last packet), conv: {:?}",
+                            state.last_pong.elapsed(),
+                            conn_id
+                        );
+                    }
+                    !closed && !timed_out
                 });
                 data.conn_map
                     .retain(|conn_id, _| data.state_map.contains_key(conn_id));
@@ -1074,6 +1095,83 @@ mod tests {
         }
         assert_eq!(got, payload.len());
 
+        drop(client_endpoint);
+        drop(server_endpoint);
+        t.join_all().await;
+    }
+
+    #[tokio::test]
+    async fn test_kcp_bulk_transfer_survives_sustained_loss() {
+        // Deterministic sustained loss on both paths (every 7th packet client->server,
+        // every 5th server->client, retransmits included). The transfer must complete
+        // with byte-exact content — this is the regression net for the stability work:
+        // handshake retransmit, KCP retransmission, ping/pong liveness all under loss.
+        let mut client_endpoint = KcpEndpoint::new();
+        let mut server_endpoint = KcpEndpoint::new();
+        let mut t = JoinSet::new();
+
+        client_endpoint.run().await;
+        server_endpoint.run().await;
+
+        let client_input_sender = client_endpoint.input_sender();
+        let mut server_output_receiver = server_endpoint.output_receiver().unwrap();
+        t.spawn(async move {
+            let mut seq = 0usize;
+            while let Some(packet) = server_output_receiver.recv().await {
+                seq += 1;
+                if seq % 5 == 0 {
+                    continue;
+                }
+                let _ = client_input_sender.send(packet).await;
+            }
+        });
+        let server_input_sender = server_endpoint.input_sender();
+        let mut client_output_receiver = client_endpoint.output_receiver().unwrap();
+        t.spawn(async move {
+            let mut seq = 0usize;
+            while let Some(packet) = client_output_receiver.recv().await {
+                seq += 1;
+                if seq % 7 == 0 {
+                    continue;
+                }
+                let _ = server_input_sender.send(packet).await;
+            }
+        });
+
+        let (connect_ret, accept_ret) = tokio::join!(
+            client_endpoint.connect(std::time::Duration::from_secs(10), 1, 3, Bytes::new()),
+            server_endpoint.accept()
+        );
+        let conv = connect_ret.expect("connect must survive lossy handshake");
+        assert_eq!(conv, accept_ret.unwrap());
+
+        let (client_sender, _cr) = client_endpoint.conn_sender_receiver(conv).unwrap();
+        let (_ss, mut server_receiver) = server_endpoint.conn_sender_receiver(conv).unwrap();
+
+        let payload: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let expected = payload.clone();
+        let send_task = tokio::spawn(async move {
+            for chunk in payload.chunks(64 * 1024) {
+                client_sender.send(BytesMut::from(chunk)).await.unwrap();
+            }
+            client_sender
+        });
+
+        let recv_all = async {
+            let mut got = Vec::with_capacity(expected.len());
+            while got.len() < expected.len() {
+                let data = server_receiver.recv().await.expect("stream ended early");
+                got.extend_from_slice(&data);
+            }
+            got
+        };
+        let got = tokio::time::timeout(std::time::Duration::from_secs(60), recv_all)
+            .await
+            .expect("lossy transfer did not complete in time");
+        assert_eq!(got.len(), expected.len());
+        assert!(got == expected, "payload corrupted in lossy transfer");
+
+        let _client_sender = send_task.await.unwrap();
         drop(client_endpoint);
         drop(server_endpoint);
         t.join_all().await;
