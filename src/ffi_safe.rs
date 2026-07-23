@@ -165,7 +165,11 @@ impl Kcp {
     pub fn next_update_delay_ms(&mut self) -> IUINT32 {
         let current = self.now.elapsed().as_millis() as IUINT32;
         let next = unsafe { ikcp_check(self.kcp, current) };
-        next - current
+        // KCP timestamps are modular u32; ikcp_check returns `current + minimal`, which wraps
+        // below `current` once elapsed-ms crosses the u32 boundary (~49.7 days uptime). A plain
+        // subtraction would panic there under overflow checks; wrapping_sub yields the correct
+        // delay in every build mode.
+        next.wrapping_sub(current)
     }
 
     pub fn send(&mut self, data: &[u8]) -> Result<usize, Error> {
