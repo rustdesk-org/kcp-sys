@@ -81,8 +81,8 @@ struct KcpConnection {
 }
 
 impl KcpConnection {
-    pub fn new(conn_id: ConnId) -> Result<Self, Error> {
-        let kcp = Kcp::new(KcpConfig::new_turbo(conn_id.conv))?;
+    pub fn new(conn_id: ConnId, config: KcpConfig) -> Result<Self, Error> {
+        let kcp = Kcp::new(config)?;
 
         let (send_sender, send_receiver) = tokio::sync::mpsc::channel(128);
         let (recv_sender, recv_receiver) = tokio::sync::mpsc::channel(128);
@@ -699,7 +699,10 @@ impl KcpEndpoint {
     }
 
     fn add_conn(&self, conn_id: ConnId) -> Result<(), Error> {
-        let mut conn = KcpConnection::new(conn_id)?;
+        // The factory was previously never consulted (KcpConnection hardcoded new_turbo),
+        // which made set_kcp_config_factory a silent no-op.
+        let config = (self.kcp_config_factory)(conn_id.conv);
+        let mut conn = KcpConnection::new(conn_id, config)?;
         conn.run(self.output_sender.clone());
 
         let data = self.data.clone();
@@ -996,6 +999,80 @@ mod tests {
         client_sender.send(BytesMut::from("hello")).await.unwrap();
         let data = server_receiver.recv().await.unwrap();
         assert_eq!("hello", String::from_utf8_lossy(&data));
+
+        drop(client_endpoint);
+        drop(server_endpoint);
+        t.join_all().await;
+    }
+
+    #[tokio::test]
+    async fn test_kcp_config_factory_is_used_and_cc_profile_transports_data() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut client_endpoint = KcpEndpoint::new();
+        let mut server_endpoint = KcpEndpoint::new();
+
+        // Congestion-controlled turbo profile (nc=0 engages KCP's built-in algorithm);
+        // the counters prove add_conn consults the factory instead of hardcoding turbo.
+        static CLIENT_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static SERVER_CALLS: AtomicUsize = AtomicUsize::new(0);
+        client_endpoint.set_kcp_config_factory(Box::new(|conv| {
+            CLIENT_CALLS.fetch_add(1, Ordering::SeqCst);
+            let mut c = KcpConfig::new_turbo(conv);
+            c.nc = Some(0);
+            c
+        }));
+        server_endpoint.set_kcp_config_factory(Box::new(|conv| {
+            SERVER_CALLS.fetch_add(1, Ordering::SeqCst);
+            let mut c = KcpConfig::new_turbo(conv);
+            c.nc = Some(0);
+            c
+        }));
+
+        client_endpoint.run().await;
+        server_endpoint.run().await;
+
+        let mut t = JoinSet::new();
+        let client_input_sender = client_endpoint.input_sender();
+        let mut server_output_receiver = server_endpoint.output_receiver().unwrap();
+        t.spawn(async move {
+            while let Some(packet) = server_output_receiver.recv().await {
+                let _ = client_input_sender.send(packet).await;
+            }
+        });
+        let server_input_sender = server_endpoint.input_sender();
+        let mut client_output_receiver = client_endpoint.output_receiver().unwrap();
+        t.spawn(async move {
+            while let Some(packet) = client_output_receiver.recv().await {
+                let _ = server_input_sender.send(packet).await;
+            }
+        });
+
+        let (connect_ret, accept_ret) = tokio::join!(
+            client_endpoint.connect(std::time::Duration::from_secs(5), 1, 3, Bytes::new()),
+            server_endpoint.accept()
+        );
+        let conv = connect_ret.unwrap();
+        assert_eq!(conv, accept_ret.unwrap());
+        assert_eq!(1, CLIENT_CALLS.load(Ordering::SeqCst));
+        assert_eq!(1, SERVER_CALLS.load(Ordering::SeqCst));
+
+        // Data flows under the congestion-controlled profile (cwnd slow-starts from 1,
+        // it must not deadlock at zero).
+        let (client_sender, _cr) = client_endpoint.conn_sender_receiver(conv).unwrap();
+        let (_ss, mut server_receiver) = server_endpoint.conn_sender_receiver(conv).unwrap();
+        let payload = vec![7u8; 256 * 1024];
+        client_sender
+            .send(BytesMut::from(&payload[..]))
+            .await
+            .unwrap();
+        let mut got = 0usize;
+        while got < payload.len() {
+            let data = server_receiver.recv().await.unwrap();
+            assert!(data.iter().all(|&b| b == 7));
+            got += data.len();
+        }
+        assert_eq!(got, payload.len());
 
         drop(client_endpoint);
         drop(server_endpoint);
