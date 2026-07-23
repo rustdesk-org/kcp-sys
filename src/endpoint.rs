@@ -122,8 +122,17 @@ impl KcpConnection {
                 conn_id.fill_packet_header(&mut kcp_packet);
                 kcp_packet.mut_header().set_data(true).set_ack(true);
                 tracing::trace!(?conv, "sending output data: {:?}", kcp_packet);
-                if let Err(e) = output_sender.try_send(kcp_packet) {
-                    tracing::debug!(?e, ?conn_id, "send output data failed");
+                match output_sender.try_send(kcp_packet) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        // Dropped here = self-inflicted loss KCP will re-pay with a
+                        // retransmit; with the enlarged channel this should not happen.
+                        log::warn!("kcp output channel full, packet dropped, conn: {:?}", conn_id);
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        // Normal during endpoint teardown.
+                        tracing::debug!(?conn_id, "kcp output channel closed");
+                    }
                 }
                 Ok(())
             }));
@@ -470,8 +479,14 @@ impl Default for KcpEndpoint {
 
 impl KcpEndpoint {
     pub fn new() -> Self {
-        let (input_sender, input_receiver) = tokio::sync::mpsc::channel(1024);
-        let (output_sender, output_receiver) = tokio::sync::mpsc::channel(1024);
+        // The output callback runs synchronously inside ikcp_flush and can only try_send:
+        // a full channel means self-inflicted packet loss. A flush burst can emit up to a
+        // whole send window (turbo sndwnd = 1024 segments) plus ACKs, so the channel must
+        // be comfortably larger than the window to never shed packets at full load. The
+        // input side gets the same headroom so a briefly stalled endpoint task does not
+        // backpressure the socket reader into dropping datagrams.
+        let (input_sender, input_receiver) = tokio::sync::mpsc::channel(4096);
+        let (output_sender, output_receiver) = tokio::sync::mpsc::channel(4096);
         let (new_conn_sender, new_conn_receiver) = tokio::sync::mpsc::channel(4);
 
         Self {
