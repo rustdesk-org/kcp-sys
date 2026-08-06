@@ -66,9 +66,10 @@ unsafe extern "C" fn ikcp_output(
     kcp: *mut ikcpcb,
     this: *mut ::std::os::raw::c_void,
 ) -> i32 {
-    // convert this to KcpConnection
-    let kcp_connection = &mut *(this as *mut Kcp);
-    debug_assert_eq!(kcp_connection.kcp, kcp);
+    // convert this to KcpConnection. A shared reborrow, not `&mut`: the flush()/update()
+    // caller already holds `&mut Kcp` through the mutex guard, so a second live `&mut`
+    // to the same object would be aliasing UB; `handle_output_callback` only needs `&self`.
+    let kcp_connection = &*(this as *const Kcp);
     if kcp_connection.kcp != kcp {
         // Defensive: a mismatched callback context means the packet cannot be routed;
         // drop it instead of aborting the process (panic = abort in release builds).
