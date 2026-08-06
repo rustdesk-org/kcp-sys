@@ -459,8 +459,21 @@ impl KcpConnectionState {
         // (an idempotent handshake retransmit, e.g. a re-sent SYN-ACK). Error-triggered
         // RSTs are suppressed here so a stray or duplicated steady-state packet cannot tear
         // down a healthy connection.
+        //
+        // One exception: a duplicated FIN reaching a conn already in Closed. The passive
+        // closer's final FIN (PeerClosed -> Closed) is emitted exactly once with no
+        // retransmit path, so when it is lost, the peer sits in LocalClosed re-sending
+        // its own FIN into this state. Answering that FIN with the RST tells it to
+        // finish now instead of after our state is reaped (<=10s) plus its next FIN
+        // slot (<=10s more) - and matches what the ping path already does for Closed
+        // conns. Incoming RSTs stay suppressed (two Closed peers would ping-pong RSTs
+        // until reap), as does data (it arrives at KCP's retransmit rate).
+        let dup_fin_into_closed = matches!(self.fsm, KcpConnectionFSM::Closed)
+            && packet.header().is_fin()
+            && !packet.header().is_rst();
         match res {
             Ok(()) => Ok(out_packet),
+            Err(_) if dup_fin_into_closed => Ok(out_packet),
             Err(_) => Ok(None),
         }
     }
@@ -1325,6 +1338,38 @@ mod tests {
         drop(client_endpoint);
         drop(server_endpoint);
         t.join_all().await;
+    }
+
+    #[tokio::test]
+    async fn test_closed_conn_answers_duplicate_fin_with_rst() {
+        // The passive closer's final FIN (PeerClosed -> Closed) is sent exactly once;
+        // when it is lost the active closer sits in LocalClosed re-sending its own
+        // FIN. A conn already in Closed must answer that duplicate FIN with a RST so
+        // the peer finishes now, not after reap + its next FIN slot (up to ~20s).
+        let mut state = KcpConnectionState::new(KcpConnectionFSM::Closed);
+
+        let mut fin = KcpPacket::new(0);
+        fin.mut_header().set_fin(true);
+        let reply = state
+            .handle_packet(&fin)
+            .expect("suppression path never errors")
+            .expect("duplicate FIN into Closed must be answered");
+        assert!(reply.header().is_rst(), "the answer is a RST");
+        assert!(
+            matches!(state.fsm, KcpConnectionFSM::Closed),
+            "state stays Closed"
+        );
+
+        // Incoming RSTs stay suppressed: two Closed peers must not ping-pong RSTs.
+        let mut rst = KcpPacket::new(0);
+        rst.mut_header().set_rst(true);
+        assert!(state.handle_packet(&rst).unwrap().is_none());
+
+        // Data into Closed stays suppressed too (it arrives at KCP retransmit rate).
+        let mut data = KcpPacket::new(0);
+        data.mut_header().set_ack(true);
+        data.mut_header().set_data(true);
+        assert!(state.handle_packet(&data).unwrap().is_none());
     }
 
     #[tokio::test(start_paused = true)]

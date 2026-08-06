@@ -211,8 +211,12 @@ impl Kcp {
     }
 
     pub fn sendwnd(&self) -> i32 {
-        // see IKCP_WND_SND
-        self.config.sndwnd.unwrap_or(32)
+        // KCP's actual window (IKCP_WND_SND = 32 when unset), not the raw config
+        // value: ikcp_wndsize silently ignores non-positive values and keeps its
+        // default, so echoing the config would let sndwnd Some(-1)/Some(0) make
+        // the flow-control comparison `waitsnd() > 2 * sendwnd()` permanently
+        // true and stall sending forever.
+        unsafe { (*self.kcp).snd_wnd as i32 }
     }
 
     fn handle_output_callback(&self, buf: BytesMut) -> Result<(), Error> {
@@ -291,5 +295,28 @@ mod tests {
         let mut kcp = Kcp::new(KcpConfig::new(1)).unwrap();
 
         kcp.reset_congestion_control().unwrap();
+    }
+
+    #[test]
+    fn sendwnd_reports_the_effective_window() {
+        // ikcp_wndsize accepts non-positive values as "keep the default", so a
+        // factory config of Some(-1)/Some(0) passes apply_config while KCP runs
+        // on IKCP_WND_SND = 32. sendwnd() must report what KCP actually uses:
+        // echoing the raw config made `waitsnd() > 2 * sendwnd()` permanently
+        // true and stalled sending forever.
+        for bad in [Some(-1), Some(0), None] {
+            let mut config = KcpConfig::new_turbo(1);
+            config.sndwnd = bad;
+            let kcp = Kcp::new(config).expect("non-positive sndwnd is accepted");
+            assert_eq!(kcp.sendwnd(), 32, "effective default for {bad:?}");
+            assert!(
+                kcp.waitsnd() <= 2 * kcp.sendwnd(),
+                "flow control must be satisfiable on an idle conn ({bad:?})"
+            );
+        }
+
+        let mut config = KcpConfig::new_turbo(1);
+        config.sndwnd = Some(1024);
+        assert_eq!(Kcp::new(config).unwrap().sendwnd(), 1024);
     }
 }

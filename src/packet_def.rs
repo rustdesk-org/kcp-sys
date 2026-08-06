@@ -294,6 +294,9 @@ mod tests {
         let _ = p.header().conv();
         let _ = p.mut_header().set_syn(true);
         let _ = p.payload();
+        // Debug walks the same unwrap paths (header(), from_bits) and runs on
+        // trace-level packet logging, so it is part of the no-abort surface.
+        let _ = format!("{p:?}");
     }
 
     #[test]
@@ -342,12 +345,20 @@ mod tests {
     fn every_flag_byte_parses() {
         // header() unwraps from_bits(); the bitflags `_ = !0` arm is what makes
         // that infallible for attacker-chosen bytes. Drop the arm and this fails.
+        // flag is the second-to-last header field (only rsv: u8 follows), so its
+        // offset tracks the layout instead of hardcoding 12: a field inserted
+        // before it would silently retarget a literal offset at some other byte
+        // and turn this test into a no-op.
+        let flag_offset = HEADER_LEN - 2;
         for flag in 0u8..=255 {
             let mut bytes = BytesMut::from(&[0u8; HEADER_LEN][..]);
-            bytes[12] = flag;
+            bytes[flag_offset] = flag;
             let p = KcpPacket::from(bytes);
             let h = p.header();
-            let _ = (h.is_syn(), h.is_ack(), h.is_fin(), h.is_data(), h.is_rst());
+            // Proves the byte written above really is the flag field: if the
+            // offset ever misses it, SYN reads back wrong for half the values.
+            assert_eq!(h.is_syn(), flag & 0b1 != 0);
+            let _ = (h.is_ack(), h.is_fin(), h.is_data(), h.is_rst());
             let _ = (h.is_ping(), h.is_pong());
         }
     }
