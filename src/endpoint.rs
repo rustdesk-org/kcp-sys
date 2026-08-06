@@ -349,13 +349,26 @@ impl PacketHeaderFlagManipulator for KcpPacket {
     }
 }
 
+// Cap on timer-driven SYN-ACK retransmits per conn: bounds the work a
+// half-open entry costs and the reflection a spoofed SYN can buy (at most
+// 1 immediate + MAX_SYN_ACK_RETRIES timed replies). The reactive
+// duplicate-SYN path is uncapped - it is 1:1 with packets the peer
+// actually sends.
+const MAX_SYN_ACK_RETRIES: u32 = 10;
+
 struct KcpConnectionState {
     fsm: KcpConnectionFSM,
     notify: Arc<Notify>,
     conn_data: Bytes,
     last_pong: std::time::Instant,
-    // Timer-driven SYN-ACK retransmits consumed so far (see the liveness task).
-    syn_ack_retries: u32,
+    // Timer-driven SYN-ACK retransmits consumed so far (see the liveness
+    // task). Atomic so the liveness scan can consume budget under DashMap's
+    // shard read lock; that task is the only writer. The budget is never
+    // replenished - once exhausted, only the 1:1 reactive duplicate-SYN path
+    // remains - and it is deliberately NOT reset on duplicate SYNs: resetting
+    // would let an attacker replenish the timed-amplification budget by
+    // spraying SYNs.
+    syn_ack_retries: AtomicU32,
 }
 
 impl std::fmt::Debug for KcpConnectionState {
@@ -373,7 +386,7 @@ impl KcpConnectionState {
             notify: Arc::new(Notify::new()),
             conn_data: Bytes::new(),
             last_pong: std::time::Instant::now(),
-            syn_ack_retries: 0,
+            syn_ack_retries: AtomicU32::new(0),
         }
     }
 
@@ -691,50 +704,51 @@ impl KcpEndpoint {
             }
         });
 
-        // conn liveness task: pings established conns every PING_INTERVAL and
-        // retransmits the SYN-ACK for conns stuck in SynReceived once per tick.
-        // The two schedules are independent: pings fire on an elapsed-time
-        // deadline, so a handshake backlog (e.g. a SYN flood parking thousands
-        // of entries in SynReceived) cannot stretch the ping cadence past the
-        // pong timeout and get healthy idle conns reaped.
+        // conn liveness task: pings established conns and retransmits the
+        // SYN-ACK for conns stuck in SynReceived. Scheduled so that no backlog
+        // of either kind can stretch the cadence:
+        // - pings are sharded by conv into PING_SLOTS slots and each 1s tick
+        //   serves one slot, so every conn is pinged about every PING_SLOTS
+        //   seconds and per-tick work stays ~N/PING_SLOTS packets;
+        // - SYN-ACK retransmits run every tick, budget-capped per conn;
+        // - everything is try_send with no pacing sleeps, keeping the loop
+        //   free of awaits under the scan. A full channel skips the packet
+        //   until the next round - channel pressure means traffic is flowing,
+        //   which already keeps the peer's pong timer fresh.
         let data = self.data.clone();
         let output_sender = self.output_sender.clone();
         self.tasks.spawn(async move {
             const TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-            const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-            // Cap timer-driven SYN-ACK retransmits per conn: bounds the work a
-            // half-open entry costs and the reflection a spoofed SYN can buy
-            // (at most 1 immediate + MAX_SYN_ACK_RETRIES timed replies). The
-            // reactive duplicate-SYN path stays uncapped - it is 1:1 with
-            // packets the peer actually sends.
-            const MAX_SYN_ACK_RETRIES: u32 = 10;
-            let mut next_ping = tokio::time::Instant::now();
+            const PING_SLOTS: u32 = 10;
+            let mut slot = 0u32;
             loop {
-                let now = tokio::time::Instant::now();
-                let send_pings = now >= next_ping;
-                if send_pings {
-                    next_ping = now + PING_INTERVAL;
-                }
-                let mut pings = Vec::new();
-                let mut syn_acks = Vec::new();
-                for mut item in data.state_map.iter_mut() {
-                    let conn_id = *item.key();
-                    let state = item.value_mut();
+                let mut packets = Vec::new();
+                for item in data.state_map.iter() {
+                    let (conn_id, state) = item.pair();
                     match state.fsm {
                         // The server has no other retransmit path: if the client's
                         // ACK+data reply was lost, the client is already Established
                         // and will never send another SYN, so the client's
                         // duplicate-SYN-ACK re-ACK branch is the only way left to
                         // finish the handshake.
-                        KcpConnectionFSM::SynReceived
-                            if state.syn_ack_retries < MAX_SYN_ACK_RETRIES =>
-                        {
-                            state.syn_ack_retries += 1;
-                            let mut out_packet = KcpPacket::new(0);
-                            out_packet.mut_header().set_syn(true);
-                            out_packet.mut_header().set_ack(true);
-                            conn_id.fill_packet_header(&mut out_packet);
-                            syn_acks.push(out_packet);
+                        KcpConnectionFSM::SynReceived => {
+                            // Consume retransmit budget; this task is the only
+                            // writer, so Relaxed suffices.
+                            let granted = state
+                                .syn_ack_retries
+                                .fetch_update(
+                                    std::sync::atomic::Ordering::Relaxed,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                    |v| (v < MAX_SYN_ACK_RETRIES).then_some(v + 1),
+                                )
+                                .is_ok();
+                            if granted {
+                                let mut out_packet = KcpPacket::new(0);
+                                out_packet.mut_header().set_syn(true);
+                                out_packet.mut_header().set_ack(true);
+                                conn_id.fill_packet_header(&mut out_packet);
+                                packets.push(out_packet);
+                            }
                         }
                         // Never ping a handshaking conn: connect()'s SYN retransmit
                         // loop owns client-side liveness, and pinging a SynSent conn
@@ -743,30 +757,22 @@ impl KcpEndpoint {
                         KcpConnectionFSM::Established
                         | KcpConnectionFSM::LocalClosed
                         | KcpConnectionFSM::PeerClosed
-                            if send_pings =>
+                            if conn_id.conv % PING_SLOTS == slot =>
                         {
                             let mut out_packet = KcpPacket::new(0);
                             out_packet.mut_header().set_ping(true);
                             conn_id.fill_packet_header(&mut out_packet);
-                            pings.push(out_packet);
+                            packets.push(out_packet);
                         }
                         _ => {}
                     }
                 }
+                slot = (slot + 1) % PING_SLOTS;
 
-                // Best-effort retries, deliberately unpaced: a full channel just
-                // waits for the next tick, so a large handshake backlog cannot
-                // stretch this pass.
-                for packet in syn_acks {
+                for packet in packets {
+                    // Best-effort: Full waits for the next round; Closed means
+                    // the endpoint is tearing down.
                     let _ = output_sender.try_send(packet);
-                }
-
-                for packet in pings {
-                    let ret = output_sender.send(packet).await;
-                    if let Err(e) = ret {
-                        log::error!("send ping packet failed: {:?}", e);
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
 
                 tokio::time::sleep(TICK_INTERVAL).await;
@@ -1177,7 +1183,11 @@ mod tests {
 
         // 1 immediate SYN-ACK from the Listen transition + MAX_SYN_ACK_RETRIES
         // timer-driven retransmits, then nothing.
-        assert_eq!(syn_acks, 11, "timer retransmits must be capped");
+        assert_eq!(
+            syn_acks,
+            1 + MAX_SYN_ACK_RETRIES as usize,
+            "timer retransmits must be capped"
+        );
 
         drop(server);
     }
