@@ -660,20 +660,26 @@ impl KcpEndpoint {
         let data = self.data.clone();
         self.tasks.spawn(async move {
             loop {
+                // Collect first, log after: retain holds a shard write lock, and a
+                // blocking logger backend would stall packet handling for that shard.
+                let mut reaped = Vec::new();
                 data.state_map.retain(|conn_id, state| {
                     let closed = matches!(state.fsm, KcpConnectionFSM::Closed);
                     let timed_out = state.is_pong_timeout();
                     if timed_out && !closed {
-                        // A silent reap was indistinguishable from every other way a
-                        // session can end; name the reason for field diagnosis.
-                        log::info!(
-                            "kcp conn reaped by pong timeout ({:?} since last packet), conv: {:?}",
-                            state.last_pong.elapsed(),
-                            conn_id
-                        );
+                        reaped.push((*conn_id, state.last_pong.elapsed()));
                     }
                     !closed && !timed_out
                 });
+                for (conn_id, since) in reaped {
+                    // A silent reap was indistinguishable from every other way a
+                    // session can end; name the reason for field diagnosis.
+                    log::info!(
+                        "kcp conn reaped by pong timeout ({:?} since last packet), conv: {:?}",
+                        since,
+                        conn_id
+                    );
+                }
                 data.conn_map
                     .retain(|conn_id, _| data.state_map.contains_key(conn_id));
                 data.state_map.shrink_to_fit();
@@ -682,22 +688,48 @@ impl KcpEndpoint {
             }
         });
 
-        // conn ping task
+        // conn liveness task: pings established conns on the old 10s cadence, and
+        // retransmits the SYN-ACK for conns stuck in SynReceived once per tick.
         let data = self.data.clone();
         let output_sender = self.output_sender.clone();
         self.tasks.spawn(async move {
+            const TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+            const PING_TICKS: u32 = 10;
+            let mut tick = 0u32;
             loop {
+                let send_pings = tick == 0;
+                tick = (tick + 1) % PING_TICKS;
                 let packets = data
                     .state_map
                     .iter()
                     .filter_map(|item| {
                         let (conn_id, state) = item.pair();
-                        if state.is_closed() {
-                            return None;
-                        }
                         let mut out_packet = KcpPacket::new(0);
+                        match state.fsm {
+                            // The server has no other retransmit path: if the client's
+                            // ACK+data reply was lost, the client is already Established
+                            // and will never send another SYN, so the client's
+                            // duplicate-SYN-ACK re-ACK branch is the only way left to
+                            // finish the handshake. Re-emit until the state advances or
+                            // the conn is reaped.
+                            KcpConnectionFSM::SynReceived => {
+                                out_packet.mut_header().set_syn(true);
+                                out_packet.mut_header().set_ack(true);
+                            }
+                            // Never ping a handshaking conn: connect()'s SYN retransmit
+                            // loop owns client-side liveness, and pinging a SynSent conn
+                            // makes a server that never saw the SYN answer RST, killing
+                            // that loop after a single SYN.
+                            KcpConnectionFSM::Established
+                            | KcpConnectionFSM::LocalClosed
+                            | KcpConnectionFSM::PeerClosed
+                                if send_pings =>
+                            {
+                                out_packet.mut_header().set_ping(true);
+                            }
+                            _ => return None,
+                        }
                         conn_id.fill_packet_header(&mut out_packet);
-                        out_packet.mut_header().set_ping(true);
                         Some(out_packet)
                     })
                     .collect::<Vec<_>>();
@@ -710,7 +742,7 @@ impl KcpEndpoint {
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
 
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                tokio::time::sleep(TICK_INTERVAL).await;
             }
         });
     }
@@ -843,6 +875,11 @@ impl KcpEndpoint {
         const MAX_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
         let mut notified_ok = false;
         loop {
+            // Check before sending: a backpressured output channel could otherwise
+            // stretch this loop well past timeout_dur and emit a SYN after the deadline.
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
             self.output_sender
                 .send(out_packet.clone())
                 .await
