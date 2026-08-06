@@ -521,9 +521,14 @@ pub type KcpConfigFactory = Box<dyn Fn(u32) -> KcpConfig + Send + Sync>;
 // any other source. Endpoints are never shared between conns: every state_map
 // / conn_map interaction below runs with a single conn, so the multi-conn
 // paths (concurrent handshakes, cross-conn lock contention, accept backlog)
-// carry no traffic here. Sharing one endpoint across many conns is EasyTier's
-// use case and upstream's to maintain - we neither exercise nor review it, and
-// changes here are judged against the single-conn model only.
+// carry no traffic here.
+//
+// Sharing one endpoint across many conns is EasyTier's use case and upstream's
+// to maintain. It is also where nearly all the difficulty in this file lives -
+// the DashMap lock ordering, the handshake and close races - and reviewing it
+// costs far more than it can return for us, since none of it is reachable from
+// rustdesk. Treat the single-conn model as the contract: judge changes against
+// it, and do not spend review effort on shared-endpoint behaviour.
 pub struct KcpEndpoint {
     id: u64,
     data: Arc<KcpEndpointData>,
