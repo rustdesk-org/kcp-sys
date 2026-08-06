@@ -200,7 +200,10 @@ impl KcpConnection {
                         // the 10ms updater on the hot path for no benefit.
                         let sent = {
                             let mut kcp = kcp.lock();
-                            if kcp.waitsnd() > 2 * kcp.sendwnd() {
+                            // saturating: a factory sndwnd near i32::MAX would make
+                            // `2 * sendwnd()` wrap negative (or panic under overflow
+                            // checks) and leave this comparison permanently true.
+                            if kcp.waitsnd() > kcp.sendwnd().saturating_mul(2) {
                                 None
                             } else {
                                 Some(kcp.send(chunk))

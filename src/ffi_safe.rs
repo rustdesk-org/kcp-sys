@@ -318,5 +318,14 @@ mod tests {
         let mut config = KcpConfig::new_turbo(1);
         config.sndwnd = Some(1024);
         assert_eq!(Kcp::new(config).unwrap().sendwnd(), 1024);
+
+        // Extreme factory value: ikcp_wndsize accepts it, and the flow-control
+        // comparison must still be satisfiable - `2 * sendwnd()` would wrap
+        // negative (or panic under overflow checks) without saturation.
+        let mut config = KcpConfig::new_turbo(1);
+        config.sndwnd = Some(i32::MAX);
+        let kcp = Kcp::new(config).unwrap();
+        assert_eq!(kcp.sendwnd(), i32::MAX);
+        assert!(kcp.waitsnd() <= kcp.sendwnd().saturating_mul(2));
     }
 }

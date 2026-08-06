@@ -5,7 +5,7 @@ pub enum Error {
     #[error("Invalid state need reset")]
     InvalidStateNeedRst,
     #[error("Connection reset")]
-    ConnectioinReset,
+    ConnectionReset,
     #[error("Create connection failed")]
     CreateConnectionFailed,
     #[error("Anyhow error")]
