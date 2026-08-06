@@ -8,7 +8,6 @@ use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use tokio::{select, sync::Notify, task::JoinSet, time::timeout};
-use tracing::Instrument;
 
 use crate::{
     error::Error,
@@ -25,6 +24,44 @@ pub type KcpPacketReceiver = Receiver<KcpPacket>;
 
 pub type KcpStreamSender = Sender<BytesMut>;
 pub type KcpStreamReceiver = Receiver<BytesMut>;
+
+/// Collapses a log site whose call rate the peer or the network controls into at
+/// most one line per interval, carrying the count of everything suppressed since
+/// the last line. Consumers (rustdesk) write debug-and-up to a log file, so an
+/// unthrottled per-packet site would let a remote peer decide how much a machine
+/// writes to disk.
+struct LogThrottle {
+    interval: std::time::Duration,
+    state: Mutex<(u64, Option<std::time::Instant>)>,
+}
+
+impl LogThrottle {
+    const fn new(interval: std::time::Duration) -> Self {
+        Self {
+            interval,
+            state: Mutex::new((0, None)),
+        }
+    }
+
+    /// Record one occurrence; `Some(n)` = report now, covering `n` occurrences.
+    fn due(&self) -> Option<u64> {
+        let mut state = self.state.lock();
+        state.0 += 1;
+        // `map_or(true, ..)` rather than clippy's preferred `is_none_or`: that was
+        // stabilized in Rust 1.82 and this crate builds with rustdesk's pinned 1.75.
+        #[allow(clippy::unnecessary_map_or)]
+        let due = state.1.map_or(true, |last| last.elapsed() >= self.interval);
+        if !due {
+            return None;
+        }
+        state.1 = Some(std::time::Instant::now());
+        Some(std::mem::replace(&mut state.0, 0))
+    }
+}
+
+const LOG_THROTTLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+static OUTPUT_FULL_LOG: LogThrottle = LogThrottle::new(LOG_THROTTLE_INTERVAL);
+static BAD_INPUT_LOG: LogThrottle = LogThrottle::new(LOG_THROTTLE_INTERVAL);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnId {
@@ -121,20 +158,27 @@ impl KcpConnection {
                 let mut kcp_packet = KcpPacket::new_with_payload(&data);
                 conn_id.fill_packet_header(&mut kcp_packet);
                 kcp_packet.mut_header().set_data(true).set_ack(true);
-                tracing::trace!(?conv, "sending output data: {:?}", kcp_packet);
+                log::trace!("sending output data, conv {}: {:?}", conv, kcp_packet);
                 match output_sender.try_send(kcp_packet) {
                     Ok(()) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         // Dropped here = self-inflicted loss KCP will re-pay with a
                         // retransmit; with the enlarged channel this should not happen.
-                        log::warn!(
-                            "kcp output channel full, packet dropped, conn: {:?}",
-                            conn_id
-                        );
+                        // Throttled: this callback runs per packet inside ikcp_flush
+                        // under the kcp lock, and a stalled consumer would otherwise
+                        // write hundreds of lines per second from under it.
+                        if let Some(n) = OUTPUT_FULL_LOG.due() {
+                            log::warn!(
+                                "kcp output channel full x{}, packet dropped, conn: {:?}",
+                                n,
+                                conn_id
+                            );
+                        }
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        // Normal during endpoint teardown.
-                        tracing::debug!(?conn_id, "kcp output channel closed");
+                        // Normal during endpoint teardown; also fires per remaining
+                        // flush packet, so keep it at trace.
+                        log::trace!("kcp output channel closed, conn: {:?}", conn_id);
                     }
                 }
                 Ok(())
@@ -176,87 +220,84 @@ impl KcpConnection {
             return;
         };
         let send_close_notifier = self.send_close_notifier.clone();
-        self.tasks.spawn(
-            async move {
-                let mut send_failed = false;
-                while let Some(data) = send_receiver.recv().await {
-                    let data = data.freeze();
-                    let max_send = kcp.lock().max_chunk_size();
+        self.tasks.spawn(async move {
+            let mut send_failed = false;
+            while let Some(data) = send_receiver.recv().await {
+                let data = data.freeze();
+                let max_send = kcp.lock().max_chunk_size();
 
-                    for chunk in data.chunks(max_send) {
-                        loop {
-                            // Probe and send under one guard; per-chunk this loop used
-                            // to take the kcp mutex four times, serializing against
-                            // the 10ms updater on the hot path for no benefit.
-                            let sent = {
-                                let mut kcp = kcp.lock();
-                                if kcp.waitsnd() > 2 * kcp.sendwnd() {
-                                    None
-                                } else {
-                                    Some(kcp.send(chunk))
-                                }
-                            };
-                            match sent {
-                                // flow control wait
-                                None => {
-                                    inner
-                                        .waiting_new_send_window
-                                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                                    inner.send_notifier.notified().await;
-                                }
-                                Some(Ok(n)) if n == chunk.len() => break,
-                                Some(ret) => {
-                                    // A failed (or short) ikcp_send leaves a hole in the
-                                    // byte stream; consuming further messages would splice
-                                    // later bytes after the gap and silently desynchronize
-                                    // the peer's framed stream. Stop consuming instead: the
-                                    // waitsnd drain below still runs, so the peer sees a
-                                    // clean prefix and then FIN.
-                                    log::error!(
-                                        "send data failed: {:?}, len: {}, closing conn: {:?}",
-                                        ret,
-                                        chunk.len(),
-                                        conn_id
-                                    );
-                                    send_failed = true;
-                                    break;
-                                }
+                for chunk in data.chunks(max_send) {
+                    loop {
+                        // Probe and send under one guard; per-chunk this loop used
+                        // to take the kcp mutex four times, serializing against
+                        // the 10ms updater on the hot path for no benefit.
+                        let sent = {
+                            let mut kcp = kcp.lock();
+                            if kcp.waitsnd() > 2 * kcp.sendwnd() {
+                                None
+                            } else {
+                                Some(kcp.send(chunk))
+                            }
+                        };
+                        match sent {
+                            // flow control wait
+                            None => {
+                                inner
+                                    .waiting_new_send_window
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                                inner.send_notifier.notified().await;
+                            }
+                            Some(Ok(n)) if n == chunk.len() => break,
+                            Some(ret) => {
+                                // A failed (or short) ikcp_send leaves a hole in the
+                                // byte stream; consuming further messages would splice
+                                // later bytes after the gap and silently desynchronize
+                                // the peer's framed stream. Stop consuming instead: the
+                                // waitsnd drain below still runs, so the peer sees a
+                                // clean prefix and then FIN.
+                                log::error!(
+                                    "send data failed: {:?}, len: {}, closing conn: {:?}",
+                                    ret,
+                                    chunk.len(),
+                                    conn_id
+                                );
+                                send_failed = true;
+                                break;
                             }
                         }
-                        if send_failed {
-                            break;
-                        }
                     }
-
-                    // One flush per message, not per chunk: the updater's own cadence
-                    // already moves mid-message chunks, and the end-of-message flush
-                    // bounds delivery latency.
-                    kcp.lock().flush();
-                    inner.update_notifier.notify_one();
-
                     if send_failed {
                         break;
                     }
                 }
 
-                tracing::debug!(
-                    ?conn_id,
-                    "connection packet sender close, waiting for waitsnd to be 0"
-                );
+                // One flush per message, not per chunk: the updater's own cadence
+                // already moves mid-message chunks, and the end-of-message flush
+                // bounds delivery latency.
+                kcp.lock().flush();
+                inner.update_notifier.notify_one();
 
-                // waiting for waitsnd to be 0
-                while kcp.lock().waitsnd() > 0 {
-                    inner
-                        .waiting_new_send_window
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    inner.send_notifier.notified().await;
+                if send_failed {
+                    break;
                 }
-
-                send_close_notifier.notify_one();
-                tracing::debug!(?conn_id, "connection packet send task done");
             }
-            .instrument(tracing::trace_span!("send_task", conn = ?conn_id)),
-        );
+
+            log::debug!(
+                "connection packet sender close, waiting for waitsnd to be 0, conn: {:?}",
+                conn_id
+            );
+
+            // waiting for waitsnd to be 0
+            while kcp.lock().waitsnd() > 0 {
+                inner
+                    .waiting_new_send_window
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                inner.send_notifier.notified().await;
+            }
+
+            send_close_notifier.notify_one();
+            log::debug!("connection packet send task done, conn: {:?}", conn_id);
+        });
 
         // handle packet recv
         let kcp = self.kcp.clone();
@@ -267,58 +308,55 @@ impl KcpConnection {
             return;
         };
         let recv_closed = self.recv_closed.clone();
-        self.tasks.spawn(
-            async move {
-                let mut buf = BytesMut::new();
-                loop {
-                    let peeksize = kcp.lock().peeksize();
-                    if peeksize < 0 {
-                        // Only an empty queue lets a peer close end the task: the
-                        // peer's FIN goes out after everything it sent was ACKed,
-                        // i.e. that data already sits in rcv_queue, and exiting on
-                        // the flag alone would truncate the tail of the stream
-                        // whenever the reader is slower than the network.
-                        if recv_closed.load(std::sync::atomic::Ordering::Relaxed) {
-                            break;
-                        }
-                        tracing::trace!("recv nothing, wait for next update");
-                        inner.recv_notifier.notified().await;
-                        continue;
-                    };
-
-                    if buf.capacity() < std::cmp::max(peeksize as usize, 1) {
-                        buf.reserve(std::cmp::max(peeksize as usize, 4096));
-                    }
-                    // Bind first: an `if let` scrutinee's lock guard would live across
-                    // the yield await below.
-                    let recv_ret = kcp.lock().recv(&mut buf);
-                    if let Err(e) = recv_ret {
-                        log::error!("recv data failed: {:?}", e);
-                        // Every known recv error self-heals on retry (-3 re-reads
-                        // peeksize and grows the buffer above), but a persistent one
-                        // must not busy-spin the worker. Yield instead of parking on
-                        // the notifier: data is already queued, so no new input may
-                        // ever arrive to fire it.
-                        tokio::task::yield_now().await;
-                        continue;
-                    }
-                    tracing::trace!("recv data ({}): {:?}", buf.len(), buf);
-                    if buf.is_empty() {
-                        // A zero-length segment (only produced by crafted input) must be
-                        // drained, not asserted on: leaving it queued would wedge the
-                        // stream, and panicking would abort the whole process.
-                        continue;
-                    }
-                    let send_ret = recv_sender.send(buf.split()).await;
-                    if send_ret.is_err() {
+        self.tasks.spawn(async move {
+            let mut buf = BytesMut::new();
+            loop {
+                let peeksize = kcp.lock().peeksize();
+                if peeksize < 0 {
+                    // Only an empty queue lets a peer close end the task: the
+                    // peer's FIN goes out after everything it sent was ACKed,
+                    // i.e. that data already sits in rcv_queue, and exiting on
+                    // the flag alone would truncate the tail of the stream
+                    // whenever the reader is slower than the network.
+                    if recv_closed.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
-                }
+                    log::trace!("recv nothing, wait for next update");
+                    inner.recv_notifier.notified().await;
+                    continue;
+                };
 
-                tracing::debug!(?conn_id, "connection packet recv task done");
+                if buf.capacity() < std::cmp::max(peeksize as usize, 1) {
+                    buf.reserve(std::cmp::max(peeksize as usize, 4096));
+                }
+                // Bind first: an `if let` scrutinee's lock guard would live across
+                // the yield await below.
+                let recv_ret = kcp.lock().recv(&mut buf);
+                if let Err(e) = recv_ret {
+                    log::error!("recv data failed: {:?}", e);
+                    // Every known recv error self-heals on retry (-3 re-reads
+                    // peeksize and grows the buffer above), but a persistent one
+                    // must not busy-spin the worker. Yield instead of parking on
+                    // the notifier: data is already queued, so no new input may
+                    // ever arrive to fire it.
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                log::trace!("recv data ({}): {:?}", buf.len(), buf);
+                if buf.is_empty() {
+                    // A zero-length segment (only produced by crafted input) must be
+                    // drained, not asserted on: leaving it queued would wedge the
+                    // stream, and panicking would abort the whole process.
+                    continue;
+                }
+                let send_ret = recv_sender.send(buf.split()).await;
+                if send_ret.is_err() {
+                    break;
+                }
             }
-            .instrument(tracing::trace_span!("recv_task", conn = ?conn_id)),
-        );
+
+            log::debug!("connection packet recv task done, conn: {:?}", conn_id);
+        });
     }
 
     fn handle_input(&mut self, packet: &KcpPacket) -> Result<(), Error> {
@@ -545,6 +583,12 @@ impl KcpEndpoint {
         // be comfortably larger than the window to never shed packets at full load. The
         // input side gets the same headroom so a briefly stalled endpoint task does not
         // backpressure the socket reader into dropping datagrams.
+        //
+        // 4096 budgets the default turbo window with 4x headroom. It is a cap that a
+        // custom kcp_config_factory must respect: the configured send windows - summed
+        // over every conn sharing this endpoint - have to stay comfortably under it, or
+        // synchronized flush bursts shed the excess as self-inflicted loss right at
+        // peak throughput.
         let (input_sender, input_receiver) = tokio::sync::mpsc::channel(4096);
         let (output_sender, output_receiver) = tokio::sync::mpsc::channel(4096);
         // 64 pending accepts: ConnId is 12 bytes, so the headroom is free, and a
@@ -601,7 +645,7 @@ impl KcpEndpoint {
                 out_packet.mut_header().set_rst(true);
             };
 
-            tracing::trace!("sending pong packet: {:?}", out_packet);
+            log::trace!("sending pong packet: {:?}", out_packet);
             let ret = output_sender.send(out_packet).await;
             if let Err(e) = ret {
                 log::error!("send pong packet failed: {:?}", e);
@@ -626,134 +670,152 @@ impl KcpEndpoint {
         let output_sender = self.output_sender.clone();
         let new_conn_sender = self.new_conn_sender.clone();
 
-        self.tasks.spawn(
-            async move {
-                while let Some(packet) = input_receiver.recv().await {
-                    tracing::trace!("recv packet: {:?}", packet);
-                    if Self::try_handle_pingpong(&data, &packet, &output_sender).await {
-                        continue;
-                    }
+        self.tasks.spawn(async move {
+            while let Some(packet) = input_receiver.recv().await {
+                log::trace!("recv packet: {:?}", packet);
+                if Self::try_handle_pingpong(&data, &packet, &output_sender).await {
+                    continue;
+                }
 
-                    let conv = ConnId::from(&packet);
-                    if packet.header().is_data() && !packet.payload().is_empty() {
-                        if let Some(mut conn) = data.conn_map.get_mut(&conv) {
-                            if let Err(e) = conn.handle_input(&packet) {
+                let conv = ConnId::from(&packet);
+                if packet.header().is_data() && !packet.payload().is_empty() {
+                    if let Some(mut conn) = data.conn_map.get_mut(&conv) {
+                        if let Err(e) = conn.handle_input(&packet) {
+                            // Malformed input arrives at the peer's rate; throttle.
+                            if let Some(n) = BAD_INPUT_LOG.due() {
                                 log::warn!(
-                                    "handle input on connection failed: {:?}, conv: {:?}",
+                                    "handle input on connection failed x{}, last: {:?}, conv: {:?}",
+                                    n,
                                     e,
                                     conv
                                 );
-                            } else {
-                                tracing::trace!(?conv, "handle input on connection done");
                             }
                         } else {
-                            tracing::debug!(
-                                ?conv,
-                                ?packet,
-                                "no conn for conv when handling data packet"
-                            );
+                            log::trace!("handle input on connection done, conv: {:?}", conv);
                         }
-                    }
-
-                    let mut state_ref = data.state_map.get_mut(&conv);
-                    let state = state_ref.as_deref_mut();
-                    let mut out_packet: Option<KcpPacket> = None;
-                    // Decisions recorded under the state guard, acted on after it drops:
-                    // conn_map must never be locked while a state_map guard is held, or
-                    // this loop deadlocks against any task nesting the other way (see
-                    // the lock-order note on the clean task below).
-                    let mut peer_closed = false;
-                    let mut closed = false;
-                    let mut established_now = false;
-                    let mut from_syn_received = false;
-                    if let Some(state) = state {
-                        let prev_established = state.is_established();
-                        from_syn_received = matches!(state.fsm, KcpConnectionFSM::SynReceived);
-                        let ret = state.handle_packet(&packet);
-                        tracing::trace!(?conv, ?state, "handle packet for conn, ret: {:?}", ret);
-                        if let Ok(pkt) = ret {
-                            out_packet = pkt;
-                        }
-
-                        established_now = !prev_established && state.is_established();
-                        peer_closed = state.is_peer_closed();
-                        closed = state.is_closed();
                     } else {
-                        if packet.header().is_rst() {
-                            tracing::debug!(?conv, "reset packet for conn, but no state");
-                            continue;
-                        }
-                        let mut tmp_fsm = KcpConnectionFSM::listen();
-                        let res = tmp_fsm.handle_packet(&packet, &mut out_packet);
-                        tracing::trace!(
-                            ?conv,
-                            ?out_packet,
-                            "handle first packet for conn, ret: {:?}",
-                            res
+                        // Fires per packet (e.g. retransmits racing conn teardown
+                        // or arriving before accept()), so trace, not debug.
+                        log::trace!(
+                            "no conn for conv when handling data packet, conv: {:?}, packet: {:?}",
+                            conv,
+                            packet
                         );
-                        if res.is_ok() {
-                            let mut conn_state = KcpConnectionState::new(tmp_fsm);
-                            conn_state.set_data(packet.payload().to_vec().into());
-                            data.state_map.insert(conv, conn_state);
-                        }
+                    }
+                }
+
+                let mut state_ref = data.state_map.get_mut(&conv);
+                let state = state_ref.as_deref_mut();
+                let mut out_packet: Option<KcpPacket> = None;
+                // Decisions recorded under the state guard, acted on after it drops:
+                // conn_map must never be locked while a state_map guard is held, or
+                // this loop deadlocks against any task nesting the other way (see
+                // the lock-order note on the clean task below).
+                let mut peer_closed = false;
+                let mut closed = false;
+                let mut peer_closed_now = false;
+                let mut closed_now = false;
+                let mut established_now = false;
+                let mut from_syn_received = false;
+                if let Some(state) = state {
+                    let prev_established = state.is_established();
+                    let prev_peer_closed = state.is_peer_closed();
+                    let prev_closed = state.is_closed();
+                    from_syn_received = matches!(state.fsm, KcpConnectionFSM::SynReceived);
+                    let ret = state.handle_packet(&packet);
+                    log::trace!(
+                        "handle packet for conn, conv: {:?}, state: {:?}, ret: {:?}",
+                        conv,
+                        state,
+                        ret
+                    );
+                    if let Ok(pkt) = ret {
+                        out_packet = pkt;
                     }
 
-                    drop(state_ref);
-
-                    if established_now
-                        && new_conn_sender.try_send(conv).is_err()
-                        && from_syn_received
-                    {
-                        // The Established transition fires exactly once; on a full
-                        // accept backlog it used to be silently discarded, stranding
-                        // a live conn no accept() can ever return while the peer
-                        // sends into it forever (its pings keep the reaper away).
-                        // Refuse it visibly instead. Only for server-side conns: a
-                        // client's own connect() is delivered through its notify, and
-                        // its channel entry going unconsumed is the normal case.
-                        log::warn!("accept backlog full, resetting conn: {:?}", conv);
-                        data.state_map.remove(&conv);
-                        let mut rst = KcpPacket::new(0);
-                        rst.mut_header().set_rst(true);
-                        conv.fill_packet_header(&mut rst);
-                        if let Err(e) = output_sender.send(rst).await {
-                            log::warn!("send reset packet failed: {:?}, conv: {:?}", e, conv);
-                        }
+                    established_now = !prev_established && state.is_established();
+                    peer_closed = state.is_peer_closed();
+                    closed = state.is_closed();
+                    peer_closed_now = !prev_peer_closed && peer_closed;
+                    closed_now = !prev_closed && closed;
+                } else {
+                    if packet.header().is_rst() {
+                        // Per stray packet, peer-controlled rate: trace.
+                        log::trace!("reset packet for conn, but no state, conv: {:?}", conv);
                         continue;
                     }
-
-                    if peer_closed {
-                        tracing::debug!(?conv, "peer half closed, close recv");
-                        if let Some(conn) = data.conn_map.get_mut(&conv) {
-                            conn.close_recv()
-                        }
+                    let mut tmp_fsm = KcpConnectionFSM::listen();
+                    let res = tmp_fsm.handle_packet(&packet, &mut out_packet);
+                    log::trace!(
+                        "handle first packet for conn, conv: {:?}, out: {:?}, ret: {:?}",
+                        conv,
+                        out_packet,
+                        res
+                    );
+                    if res.is_ok() {
+                        let mut conn_state = KcpConnectionState::new(tmp_fsm);
+                        conn_state.set_data(packet.payload().to_vec().into());
+                        data.state_map.insert(conv, conn_state);
                     }
+                }
 
-                    if closed {
-                        // state map will be cleaned by periodic task.
-                        // Log the close cause at info: session-death reasons are the
-                        // first thing needed when users report drops.
+                drop(state_ref);
+
+                if established_now && new_conn_sender.try_send(conv).is_err() && from_syn_received {
+                    // The Established transition fires exactly once; on a full
+                    // accept backlog it used to be silently discarded, stranding
+                    // a live conn no accept() can ever return while the peer
+                    // sends into it forever (its pings keep the reaper away).
+                    // Refuse it visibly instead. Only for server-side conns: a
+                    // client's own connect() is delivered through its notify, and
+                    // its channel entry going unconsumed is the normal case.
+                    log::warn!("accept backlog full, resetting conn: {:?}", conv);
+                    data.state_map.remove(&conv);
+                    let mut rst = KcpPacket::new(0);
+                    rst.mut_header().set_rst(true);
+                    conv.fill_packet_header(&mut rst);
+                    if let Err(e) = output_sender.send(rst).await {
+                        log::warn!("send reset packet failed: {:?}, conv: {:?}", e, conv);
+                    }
+                    continue;
+                }
+
+                if peer_closed {
+                    if peer_closed_now {
+                        log::debug!("peer half closed, close recv, conv: {:?}", conv);
+                    }
+                    if let Some(conn) = data.conn_map.get_mut(&conv) {
+                        conn.close_recv()
+                    }
+                }
+
+                if closed {
+                    // state map will be cleaned by periodic task.
+                    // Log the close cause at info - session-death reasons are the
+                    // first thing needed when users report drops - but only on the
+                    // transition: until the <=10s reap, every retransmitted packet
+                    // reaching the Closed state would re-log the same line.
+                    if closed_now {
                         log::info!(
                             "kcp conn closed by peer packet (rst: {}, fin: {}), conv: {:?}",
                             packet.header().is_rst(),
                             packet.header().is_fin(),
                             conv
                         );
-                        data.conn_map.remove(&conv);
                     }
+                    data.conn_map.remove(&conv);
+                }
 
-                    if let Some(mut out_packet) = out_packet {
-                        conv.fill_packet_header(&mut out_packet);
-                        tracing::trace!(?conv, ?out_packet, "sending output packet");
-                        let ret = output_sender.send(out_packet).await;
-                        if let Err(e) = ret {
-                            log::warn!("send output packet failed: {:?}", e);
-                        }
+                if let Some(mut out_packet) = out_packet {
+                    conv.fill_packet_header(&mut out_packet);
+                    log::trace!("sending output packet, conv: {:?}: {:?}", conv, out_packet);
+                    let ret = output_sender.send(out_packet).await;
+                    if let Err(e) = ret {
+                        log::warn!("send output packet failed: {:?}", e);
                     }
                 }
             }
-            .instrument(tracing::trace_span!("recv_task", id = self.id)),
-        );
+        });
 
         // conn clean task
         let data = self.data.clone();
@@ -934,7 +996,11 @@ impl KcpEndpoint {
                 data.conn_map.remove(&conn_id);
             }
 
-            tracing::debug!(?conn_id, ?cur_state, "connection close watcher done");
+            log::debug!(
+                "connection close watcher done, conn: {:?}, state: {:?}",
+                conn_id,
+                cur_state
+            );
         });
 
         Ok(())
@@ -973,7 +1039,6 @@ impl KcpEndpoint {
         Some(state.conn_data.clone())
     }
 
-    #[tracing::instrument(ret)]
     pub async fn connect(
         &self,
         timeout_dur: std::time::Duration,
@@ -1005,7 +1070,7 @@ impl KcpEndpoint {
 
         conn_id.fill_packet_header(&mut out_packet);
 
-        tracing::trace!(?conn_id, "connect packet: {:?}", out_packet);
+        log::trace!("connect packet, conn: {:?}: {:?}", conn_id, out_packet);
 
         // Retransmit the SYN until the handshake advances or the overall timeout elapses.
         // KCP's connect packet is a single datagram; right after UDP hole punching the first
@@ -1062,7 +1127,11 @@ impl KcpEndpoint {
         }
 
         if let Some(state) = self.data.state_map.get(&conn_id) {
-            tracing::debug!(?conn_id, ?state, "connect done, checkin state");
+            log::debug!(
+                "connect done, checking state, conn: {:?}, state: {:?}",
+                conn_id,
+                *state
+            );
             if matches!(state.fsm, KcpConnectionFSM::Established) {
                 self.add_conn(conn_id)?;
                 return Ok(conn_id);
@@ -1085,7 +1154,7 @@ impl KcpEndpoint {
             };
 
             let Some(state) = self.data.state_map.get(&conn_id) else {
-                tracing::debug!(?conn_id, "no state for conn, ignore");
+                log::debug!("no state for conn, ignore, conn: {:?}", conn_id);
                 continue;
             };
 
@@ -1099,21 +1168,7 @@ impl KcpEndpoint {
 
 #[cfg(test)]
 mod tests {
-    use tracing::level_filters::LevelFilter;
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer as _};
-
     use super::*;
-
-    fn _enable_log() {
-        let console_layer = tracing_subscriber::fmt::layer()
-            .pretty()
-            .with_writer(std::io::stderr)
-            .with_filter(LevelFilter::TRACE);
-
-        tracing_subscriber::Registry::default()
-            .with(console_layer)
-            .init();
-    }
 
     async fn prepare_test() -> (KcpEndpoint, KcpEndpoint, JoinSet<()>) {
         let mut client_endpoint = KcpEndpoint::new();
@@ -1563,14 +1618,12 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         let mut got = Vec::with_capacity(payload.len());
-        loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(10), server_receiver.recv())
+        while let Some(data) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), server_receiver.recv())
                 .await
                 .expect("reader starved waiting for the close tail")
-            {
-                Some(data) => got.extend_from_slice(&data),
-                None => break,
-            }
+        {
+            got.extend_from_slice(&data);
         }
         assert_eq!(
             got.len(),
