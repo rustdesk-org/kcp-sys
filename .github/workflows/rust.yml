@@ -34,6 +34,11 @@ jobs:
       - name: Clippy
         run: cargo clippy -- -D warnings
 
+      # Separate target: the run above lints the lib only, so lints living in
+      # test code went unnoticed until a local --tests run tripped over them.
+      - name: Clippy (tests)
+        run: cargo clippy --tests -- -D warnings
+
   # ──────────────────────────────────────────────
   # Native build + test matrix
   # 6 runners × 2 profiles = 12 jobs

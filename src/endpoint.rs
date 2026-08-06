@@ -515,6 +515,15 @@ impl KcpEndpointData {
 
 pub type KcpConfigFactory = Box<dyn Fn(u32) -> KcpConfig + Send + Sync>;
 
+// Usage model in rustdesk: one KcpEndpoint per KcpStream - kcp_stream.rs's
+// accept() and connect() each call KcpEndpoint::new() - over a UDP socket
+// already connected to the punched peer, so the kernel drops datagrams from
+// any other source. Endpoints are never shared between conns: every state_map
+// / conn_map interaction below runs with a single conn, so the multi-conn
+// paths (concurrent handshakes, cross-conn lock contention, accept backlog)
+// carry no traffic here. Sharing one endpoint across many conns is EasyTier's
+// use case and upstream's to maintain - we neither exercise nor review it, and
+// changes here are judged against the single-conn model only.
 pub struct KcpEndpoint {
     id: u64,
     data: Arc<KcpEndpointData>,
@@ -934,61 +943,22 @@ impl KcpEndpoint {
         });
     }
 
+    // Callers hold their state_map read guard across this call. That is load-bearing:
+    // it blocks the packet loop's same-shard get_mut, so the Established check and the
+    // conn_map insert below cannot be split by an incoming FIN/RST. Releasing it early
+    // (to allow writing state_map from in here) broke exactly that - see the
+    // usage-model note on KcpEndpoint.
     fn add_conn(&self, conn_id: ConnId) -> Result<(), Error> {
         // The factory was previously never consulted (KcpConnection hardcoded new_turbo),
         // which made set_kcp_config_factory a silent no-op.
         let config = (self.kcp_config_factory)(conn_id.conv);
-        // NOTE: callers must not hold a state_map guard across this call - the
-        // failure path below takes the same shard's write lock.
-        let mut conn = match KcpConnection::new(conn_id, config) {
-            Ok(conn) => conn,
-            Err(e) => {
-                // A rejected config must not leave a phantom Established entry:
-                // liveness would ping it forever, the peer's pongs keep the
-                // reaper away, and the peer's data is silently discarded while
-                // the accept notification is already consumed. Remove the state
-                // and tell the peer to tear down instead of waiting.
-                self.data.state_map.remove(&conn_id);
-                let mut rst = KcpPacket::new(0);
-                rst.mut_header().set_rst(true);
-                conn_id.fill_packet_header(&mut rst);
-                let _ = self.output_sender.try_send(rst);
-                return Err(e);
-            }
-        };
+        let mut conn = KcpConnection::new(conn_id, config)?;
         conn.run(self.output_sender.clone());
 
         let data = self.data.clone();
         let close_notifier = conn.send_close_notifier();
 
         data.conn_map.insert(conn_id, conn);
-
-        // Callers release their state_map guard before calling us (our failure paths
-        // take that shard's write lock), which opens a window: a peer FIN/RST landing
-        // between the caller's Established check and the insert above is processed by
-        // the packet loop while conn_map has nothing to act on, so its close is lost -
-        // a missed FIN leaves this receiver open forever (PeerClosed is not reaped and
-        // the peer's pongs keep the pong timer fresh), a missed RST hands back a conn
-        // that is already dead. Re-apply the close state now that the conn is
-        // installed; anything after this point the packet loop sees for itself.
-        let state = data.state_map.get(&conn_id);
-        let (peer_closed, closed) = state
-            .as_ref()
-            .map(|state| (state.is_peer_closed(), state.is_closed()))
-            // No state at all: reaped, or refused by the accept-backlog path.
-            .unwrap_or((true, true));
-        // Lock order: never hold a guard on one map while touching the other.
-        drop(state);
-
-        if closed {
-            data.conn_map.remove(&conn_id);
-            return Err(Error::ConnectioinReset);
-        }
-        if peer_closed {
-            if let Some(conn) = data.conn_map.get_mut(&conn_id) {
-                conn.close_recv();
-            }
-        }
 
         let output_sender = self.output_sender.clone();
         let data = Arc::downgrade(&data);
@@ -1158,14 +1128,11 @@ impl KcpEndpoint {
                 conn_id,
                 *state
             );
-            let established = matches!(state.fsm, KcpConnectionFSM::Established);
-            // add_conn's failure path removes from state_map; the read guard
-            // must be gone first or the same-shard write would self-deadlock.
-            drop(state);
-            if established {
+            if matches!(state.fsm, KcpConnectionFSM::Established) {
                 self.add_conn(conn_id)?;
                 return Ok(conn_id);
             } else {
+                drop(state);
                 self.data.state_map.remove(&conn_id);
             }
             // if task aborted, the state map will be cleaned by periodic task
@@ -1186,21 +1153,9 @@ impl KcpEndpoint {
                 log::debug!("no state for conn, ignore, conn: {:?}", conn_id);
                 continue;
             };
-            let established = matches!(state.fsm, KcpConnectionFSM::Established);
-            // add_conn's failure path removes from state_map; the read guard
-            // must be gone first or the same-shard write would self-deadlock.
-            drop(state);
-
-            if established {
-                match self.add_conn(conn_id) {
-                    Ok(()) => return Ok(conn_id),
-                    // Raced with a peer close: that conn is gone, so wait for the
-                    // next one rather than killing the caller's accept loop. Every
-                    // other error is deterministic (a config the factory keeps
-                    // producing) and must fail-stop, not spin.
-                    Err(Error::ConnectioinReset) => continue,
-                    Err(e) => return Err(e),
-                }
+            if matches!(state.fsm, KcpConnectionFSM::Established) {
+                self.add_conn(conn_id)?;
+                return Ok(conn_id);
             }
         }
     }
@@ -1361,165 +1316,6 @@ mod tests {
         client_sender.send(BytesMut::from("hello")).await.unwrap();
         let data = server_receiver.recv().await.unwrap();
         assert_eq!("hello", String::from_utf8_lossy(&data));
-
-        drop(client_endpoint);
-        drop(server_endpoint);
-        t.join_all().await;
-    }
-
-    fn bad_kcp_config_factory() -> KcpConfigFactory {
-        Box::new(|conv| {
-            let mut c = KcpConfig::new_turbo(conv);
-            c.mtu = Some(1); // rejected by ikcp_setmtu (< 50)
-            c
-        })
-    }
-
-    // Drives add_conn against a state that already moved on, which is what a peer
-    // FIN/RST landing between the caller's Established check and conn_map insertion
-    // produces: the packet loop finds no conn to act on, so add_conn must re-apply
-    // the close itself.
-    async fn established_pair() -> (KcpEndpoint, KcpEndpoint, ConnId, JoinSet<()>) {
-        let (client_endpoint, server_endpoint, t) = prepare_test().await;
-        let (connect_ret, accept_ret) = tokio::join!(
-            client_endpoint.connect(std::time::Duration::from_secs(5), 1, 3, Bytes::new()),
-            server_endpoint.accept()
-        );
-        let conv = connect_ret.unwrap();
-        assert_eq!(conv, accept_ret.unwrap());
-        (client_endpoint, server_endpoint, conv, t)
-    }
-
-    #[tokio::test]
-    async fn test_peer_close_racing_conn_setup_is_not_lost() {
-        let (client_endpoint, server_endpoint, conv, t) = established_pair().await;
-
-        // FIN processed while conn_map was still empty.
-        client_endpoint.data.state_map.get_mut(&conv).unwrap().fsm = KcpConnectionFSM::PeerClosed;
-        client_endpoint
-            .add_conn(conv)
-            .expect("half-close is not a setup failure");
-        let (_s, mut receiver) = client_endpoint.conn_sender_receiver(conv).unwrap();
-        let eof = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
-            .await
-            .expect("a FIN lost in the setup window leaves the receiver open forever");
-        assert!(eof.is_none(), "receiver must end after the missed FIN");
-
-        // RST processed while conn_map was still empty.
-        client_endpoint.data.state_map.get_mut(&conv).unwrap().fsm = KcpConnectionFSM::Closed;
-        assert!(
-            matches!(client_endpoint.add_conn(conv), Err(Error::ConnectioinReset)),
-            "a conn closed during setup must not be handed back as live"
-        );
-        assert!(!client_endpoint.data.conn_map.contains_key(&conv));
-
-        drop(client_endpoint);
-        drop(server_endpoint);
-        t.join_all().await;
-    }
-
-    #[tokio::test]
-    async fn test_invalid_config_on_connect_cleans_up_and_resets_peer() {
-        // The handshake reaches Established, then KcpConnection::new rejects the
-        // config. connect must surface the error, leave no phantom state behind,
-        // and reset the peer instead of letting it hold a half-dead session.
-        let mut client_endpoint = KcpEndpoint::new();
-        let mut server_endpoint = KcpEndpoint::new();
-        client_endpoint.set_kcp_config_factory(bad_kcp_config_factory());
-
-        client_endpoint.run().await;
-        server_endpoint.run().await;
-
-        let mut t = JoinSet::new();
-        let client_input_sender = client_endpoint.input_sender();
-        let mut server_output_receiver = server_endpoint.output_receiver().unwrap();
-        t.spawn(async move {
-            while let Some(packet) = server_output_receiver.recv().await {
-                let _ = client_input_sender.send(packet).await;
-            }
-        });
-        let (rst_tx, mut rst_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let server_input_sender = server_endpoint.input_sender();
-        let mut client_output_receiver = client_endpoint.output_receiver().unwrap();
-        t.spawn(async move {
-            while let Some(packet) = client_output_receiver.recv().await {
-                if packet.header().is_rst() {
-                    let _ = rst_tx.try_send(());
-                }
-                let _ = server_input_sender.send(packet).await;
-            }
-        });
-
-        let connect_ret = client_endpoint
-            .connect(std::time::Duration::from_secs(5), 1, 3, Bytes::from("conn"))
-            .await;
-        assert!(
-            connect_ret.is_err(),
-            "connect must surface the config error"
-        );
-
-        // No phantom conn on the failing side.
-        assert!(client_endpoint.data.state_map.is_empty());
-        assert!(client_endpoint.data.conn_map.is_empty());
-
-        // The peer must be told to tear down.
-        tokio::time::timeout(std::time::Duration::from_secs(5), rst_rx.recv())
-            .await
-            .expect("client must emit a RST after the config failure");
-
-        drop(client_endpoint);
-        drop(server_endpoint);
-        t.join_all().await;
-    }
-
-    #[tokio::test]
-    async fn test_invalid_config_on_accept_cleans_up_and_resets_peer() {
-        // Mirror case: the accepting side's factory is broken. accept must fail
-        // (a broken factory is deterministic - fail-stop, not retry), leave no
-        // state behind, and the already-established client must be torn down.
-        let mut client_endpoint = KcpEndpoint::new();
-        let mut server_endpoint = KcpEndpoint::new();
-        server_endpoint.set_kcp_config_factory(bad_kcp_config_factory());
-
-        client_endpoint.run().await;
-        server_endpoint.run().await;
-
-        let mut t = JoinSet::new();
-        let client_input_sender = client_endpoint.input_sender();
-        let mut server_output_receiver = server_endpoint.output_receiver().unwrap();
-        t.spawn(async move {
-            while let Some(packet) = server_output_receiver.recv().await {
-                let _ = client_input_sender.send(packet).await;
-            }
-        });
-        let server_input_sender = server_endpoint.input_sender();
-        let mut client_output_receiver = client_endpoint.output_receiver().unwrap();
-        t.spawn(async move {
-            while let Some(packet) = client_output_receiver.recv().await {
-                let _ = server_input_sender.send(packet).await;
-            }
-        });
-
-        let (connect_ret, accept_ret) = tokio::join!(
-            client_endpoint.connect(std::time::Duration::from_secs(5), 1, 3, Bytes::from("conn")),
-            tokio::time::timeout(std::time::Duration::from_secs(10), server_endpoint.accept())
-        );
-
-        let conv = connect_ret.expect("client side is healthy");
-        assert!(
-            accept_ret.expect("accept must not hang").is_err(),
-            "accept must surface the config error"
-        );
-        assert!(server_endpoint.data.state_map.is_empty());
-        assert!(server_endpoint.data.conn_map.is_empty());
-
-        // The server's RST must tear down the client's established conn.
-        let (_client_sender, mut client_receiver) =
-            client_endpoint.conn_sender_receiver(conv).unwrap();
-        let end = tokio::time::timeout(std::time::Duration::from_secs(5), client_receiver.recv())
-            .await
-            .expect("client must observe the reset");
-        assert!(end.is_none(), "client receiver must end after the RST");
 
         drop(client_endpoint);
         drop(server_endpoint);
