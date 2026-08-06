@@ -547,7 +547,10 @@ impl KcpEndpoint {
         // backpressure the socket reader into dropping datagrams.
         let (input_sender, input_receiver) = tokio::sync::mpsc::channel(4096);
         let (output_sender, output_receiver) = tokio::sync::mpsc::channel(4096);
-        let (new_conn_sender, new_conn_receiver) = tokio::sync::mpsc::channel(4);
+        // 64 pending accepts: ConnId is 12 bytes, so the headroom is free, and a
+        // handshake burst between accept() polls should not hit the reset path in
+        // the packet loop.
+        let (new_conn_sender, new_conn_receiver) = tokio::sync::mpsc::channel(64);
 
         Self {
             id: rand::random(),
@@ -661,18 +664,18 @@ impl KcpEndpoint {
                     // the lock-order note on the clean task below).
                     let mut peer_closed = false;
                     let mut closed = false;
+                    let mut established_now = false;
+                    let mut from_syn_received = false;
                     if let Some(state) = state {
                         let prev_established = state.is_established();
+                        from_syn_received = matches!(state.fsm, KcpConnectionFSM::SynReceived);
                         let ret = state.handle_packet(&packet);
                         tracing::trace!(?conv, ?state, "handle packet for conn, ret: {:?}", ret);
                         if let Ok(pkt) = ret {
                             out_packet = pkt;
                         }
 
-                        if !prev_established && state.is_established() {
-                            let _ = new_conn_sender.try_send(conv);
-                        }
-
+                        established_now = !prev_established && state.is_established();
                         peer_closed = state.is_peer_closed();
                         closed = state.is_closed();
                     } else {
@@ -696,6 +699,28 @@ impl KcpEndpoint {
                     }
 
                     drop(state_ref);
+
+                    if established_now
+                        && new_conn_sender.try_send(conv).is_err()
+                        && from_syn_received
+                    {
+                        // The Established transition fires exactly once; on a full
+                        // accept backlog it used to be silently discarded, stranding
+                        // a live conn no accept() can ever return while the peer
+                        // sends into it forever (its pings keep the reaper away).
+                        // Refuse it visibly instead. Only for server-side conns: a
+                        // client's own connect() is delivered through its notify, and
+                        // its channel entry going unconsumed is the normal case.
+                        log::warn!("accept backlog full, resetting conn: {:?}", conv);
+                        data.state_map.remove(&conv);
+                        let mut rst = KcpPacket::new(0);
+                        rst.mut_header().set_rst(true);
+                        conv.fill_packet_header(&mut rst);
+                        if let Err(e) = output_sender.send(rst).await {
+                            log::warn!("send reset packet failed: {:?}, conv: {:?}", e, conv);
+                        }
+                        continue;
+                    }
 
                     if peer_closed {
                         tracing::debug!(?conv, "peer half closed, close recv");
@@ -771,13 +796,15 @@ impl KcpEndpoint {
             }
         });
 
-        // conn liveness task: pings established conns and retransmits the
-        // SYN-ACK for conns stuck in SynReceived. Scheduled so that no backlog
-        // of either kind can stretch the cadence:
+        // conn liveness task: pings established conns, retransmits the SYN-ACK
+        // for conns stuck in SynReceived and the FIN for conns in LocalClosed.
+        // Scheduled so that no backlog of either kind can stretch the cadence:
         // - pings are sharded by conv into PING_SLOTS slots and each 1s tick
         //   serves one slot, so every conn is pinged about every PING_SLOTS
-        //   seconds and per-tick work stays ~N/PING_SLOTS packets;
-        // - SYN-ACK retransmits run every tick, budget-capped per conn;
+        //   seconds and per-tick work stays ~N/PING_SLOTS packets (LocalClosed
+        //   conns re-send their FIN in their slot instead of a ping);
+        // - SYN-ACK retransmits run every tick, budget-capped per conn, the
+        //   budget consumed only when the output channel accepts the packet;
         // - everything is try_send with no pacing sleeps, keeping the loop
         //   free of awaits under the scan. A full channel skips the packet
         //   until the next round - channel pressure means traffic is flowing,
@@ -799,35 +826,51 @@ impl KcpEndpoint {
                         // duplicate-SYN-ACK re-ACK branch is the only way left to
                         // finish the handshake.
                         KcpConnectionFSM::SynReceived => {
-                            // Consume retransmit budget; this task is the only
-                            // writer, so Relaxed suffices.
-                            let granted = state
+                            // Consume retransmit budget only when the output channel
+                            // actually accepts the packet: burning it at scan time
+                            // would let ~10 congested ticks spend every capped
+                            // retransmit without one reaching the wire, and this
+                            // timer is the only recovery left once the client is
+                            // Established. This task is the only writer, so a plain
+                            // load/store suffices.
+                            let spent = state
                                 .syn_ack_retries
-                                .fetch_update(
-                                    std::sync::atomic::Ordering::Relaxed,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                    |v| (v < MAX_SYN_ACK_RETRIES).then_some(v + 1),
-                                )
-                                .is_ok();
-                            if granted {
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            if spent < MAX_SYN_ACK_RETRIES {
                                 let mut out_packet = KcpPacket::new(0);
                                 out_packet.mut_header().set_syn(true);
                                 out_packet.mut_header().set_ack(true);
                                 conn_id.fill_packet_header(&mut out_packet);
-                                packets.push(out_packet);
+                                if output_sender.try_send(out_packet).is_ok() {
+                                    state
+                                        .syn_ack_retries
+                                        .store(spent + 1, std::sync::atomic::Ordering::Relaxed);
+                                }
                             }
                         }
                         // Never ping a handshaking conn: connect()'s SYN retransmit
                         // loop owns client-side liveness, and pinging a SynSent conn
                         // makes a server that never saw the SYN answer RST, killing
                         // that loop after a single SYN.
-                        KcpConnectionFSM::Established
-                        | KcpConnectionFSM::LocalClosed
-                        | KcpConnectionFSM::PeerClosed
+                        KcpConnectionFSM::Established | KcpConnectionFSM::PeerClosed
                             if conn_id.conv % PING_SLOTS == slot =>
                         {
                             let mut out_packet = KcpPacket::new(0);
                             out_packet.mut_header().set_ping(true);
+                            conn_id.fill_packet_header(&mut out_packet);
+                            packets.push(out_packet);
+                        }
+                        // The close watcher emits the FIN exactly once and nothing
+                        // below this layer retransmits it, so a single lost FIN
+                        // datagram would leave the peer half-open forever: both sides
+                        // keep answering pings, the pong reaper never fires, and the
+                        // peer's reader blocks indefinitely. Re-emit the FIN on the
+                        // ping cadence until the peer's FIN/RST moves us to Closed -
+                        // a duplicate FIN is idempotent in every peer state, and it
+                        // refreshes the peer's pong timer just like a ping would.
+                        KcpConnectionFSM::LocalClosed if conn_id.conv % PING_SLOTS == slot => {
+                            let mut out_packet = KcpPacket::new(0);
+                            out_packet.mut_header().set_fin(true);
                             conn_id.fill_packet_header(&mut out_packet);
                             packets.push(out_packet);
                         }
@@ -977,13 +1020,16 @@ impl KcpEndpoint {
         loop {
             // Check before sending: a backpressured output channel could otherwise
             // stretch this loop well past timeout_dur and emit a SYN after the deadline.
-            if tokio::time::Instant::now() >= deadline {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
                 break;
             }
-            self.output_sender
-                .send(out_packet.clone())
-                .await
-                .with_context(|| "send connect packet failed")?;
+            match timeout(deadline - now, self.output_sender.send(out_packet.clone())).await {
+                Ok(ret) => ret.with_context(|| "send connect packet failed")?,
+                // Deadline hit while backpressured: fall out to the Established
+                // re-check below instead of blocking here and emitting a stale SYN.
+                Err(_) => break,
+            }
 
             let now = tokio::time::Instant::now();
             if now >= deadline {
@@ -998,8 +1044,21 @@ impl KcpEndpoint {
         }
 
         if !notified_ok {
-            self.data.state_map.remove(&conn_id);
-            return Err(Error::ConnectTimeout);
+            // The deadline can land in the gap after the peer's SYN-ACK advanced the
+            // FSM but before this task polled `notified` again. The state is the
+            // truth: removing an Established entry here would return a spurious
+            // timeout for a handshake the server has already accepted (and answered),
+            // stranding an orphaned conn on its side.
+            let established = self
+                .data
+                .state_map
+                .get(&conn_id)
+                .map(|state| matches!(state.fsm, KcpConnectionFSM::Established))
+                .unwrap_or(false);
+            if !established {
+                self.data.state_map.remove(&conn_id);
+                return Err(Error::ConnectTimeout);
+            }
         }
 
         if let Some(state) = self.data.state_map.get(&conn_id) {
@@ -1410,6 +1469,67 @@ mod tests {
         assert!(got == expected, "payload corrupted in lossy transfer");
 
         let _client_sender = send_task.await.unwrap();
+        drop(client_endpoint);
+        drop(server_endpoint);
+        t.join_all().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_kcp_lost_fin_is_retransmitted() {
+        // Drop the client's first FIN. The close watcher sends it exactly once, so
+        // only the liveness task's FIN retransmit can tell the server the stream
+        // ended; without it the server's reader blocks forever while pings keep
+        // both pong timers fresh on each side.
+        let mut client_endpoint = KcpEndpoint::new();
+        let mut server_endpoint = KcpEndpoint::new();
+        let mut t = JoinSet::new();
+
+        client_endpoint.run().await;
+        server_endpoint.run().await;
+
+        let client_input_sender = client_endpoint.input_sender();
+        let mut server_output_receiver = server_endpoint.output_receiver().unwrap();
+        t.spawn(async move {
+            while let Some(packet) = server_output_receiver.recv().await {
+                let _ = client_input_sender.send(packet).await;
+            }
+        });
+
+        let server_input_sender = server_endpoint.input_sender();
+        let mut client_output_receiver = client_endpoint.output_receiver().unwrap();
+        t.spawn(async move {
+            let mut fin_dropped = false;
+            while let Some(packet) = client_output_receiver.recv().await {
+                if packet.header().is_fin() && !fin_dropped {
+                    fin_dropped = true;
+                    continue;
+                }
+                let _ = server_input_sender.send(packet).await;
+            }
+        });
+
+        let (connect_ret, accept_ret) = tokio::join!(
+            client_endpoint.connect(std::time::Duration::from_secs(5), 1, 3, Bytes::new()),
+            server_endpoint.accept()
+        );
+        let conv = connect_ret.unwrap();
+        assert_eq!(conv, accept_ret.unwrap());
+
+        let (client_sender, _cr) = client_endpoint.conn_sender_receiver(conv).unwrap();
+        let (_ss, mut server_receiver) = server_endpoint.conn_sender_receiver(conv).unwrap();
+
+        client_sender.send(BytesMut::from("hello")).await.unwrap();
+        let data = server_receiver.recv().await.unwrap();
+        assert_eq!("hello", String::from_utf8_lossy(&data));
+
+        drop(client_sender);
+        // The reader must see end-of-stream via the retransmitted FIN (ping-slot
+        // cadence, at most PING_SLOTS + 1 virtual seconds away), not hang forever.
+        let eof = tokio::time::timeout(std::time::Duration::from_secs(30), server_receiver.recv())
+            .await
+            .expect("lost FIN was never retransmitted; reader hung");
+        assert!(eof.is_none(), "expected end-of-stream after close");
+
         drop(client_endpoint);
         drop(server_endpoint);
         t.join_all().await;
