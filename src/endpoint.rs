@@ -127,7 +127,10 @@ impl KcpConnection {
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         // Dropped here = self-inflicted loss KCP will re-pay with a
                         // retransmit; with the enlarged channel this should not happen.
-                        log::warn!("kcp output channel full, packet dropped, conn: {:?}", conn_id);
+                        log::warn!(
+                            "kcp output channel full, packet dropped, conn: {:?}",
+                            conn_id
+                        );
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                         // Normal during endpoint teardown.
@@ -402,13 +405,6 @@ impl KcpConnectionState {
         matches!(
             self.fsm,
             KcpConnectionFSM::PeerClosed | KcpConnectionFSM::Closed
-        )
-    }
-
-    fn is_local_closed(&self) -> bool {
-        matches!(
-            self.fsm,
-            KcpConnectionFSM::LocalClosed | KcpConnectionFSM::Closed
         )
     }
 
@@ -1012,8 +1008,7 @@ mod tests {
         );
 
         // Data must still flow over the recovered handshake.
-        let (client_sender, _client_receiver) =
-            client_endpoint.conn_sender_receiver(conv).unwrap();
+        let (client_sender, _client_receiver) = client_endpoint.conn_sender_receiver(conv).unwrap();
         let (_server_sender, mut server_receiver) =
             server_endpoint.conn_sender_receiver(conv).unwrap();
 
