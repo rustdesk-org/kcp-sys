@@ -2,6 +2,10 @@
 name = "kcp-sys"
 version = "0.1.0"
 edition = "2021"
+# Matches rustdesk's own rust-version: clippy reads this and stops proposing
+# APIs newer than it (is_multiple_of 1.87, is_none_or 1.82, ...), so those
+# suggestions no longer have to be silenced one #[allow] at a time.
+rust-version = "1.75"
 authors = ["sunsijie@buaa.edu.cn"]
 description = "Safe bindings for KCP transport protocol"
 repository = "https://github.com/EasyTier/kcp-sys"

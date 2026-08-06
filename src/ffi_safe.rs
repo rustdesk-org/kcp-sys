@@ -73,7 +73,9 @@ unsafe extern "C" fn ikcp_output(
     if kcp_connection.kcp != kcp {
         // Defensive: a mismatched callback context means the packet cannot be routed;
         // drop it instead of aborting the process (panic = abort in release builds).
-        log::error!("kcp output callback context mismatch");
+        // Throttled: this runs per packet from inside ikcp_flush, so if the invariant
+        // ever did break it would write a line per outgoing datagram.
+        crate::log_throttle::throttled_log!(error, "kcp output callback context mismatch");
         return 0;
     }
 

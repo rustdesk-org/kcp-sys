@@ -25,43 +25,12 @@ pub type KcpPacketReceiver = Receiver<KcpPacket>;
 pub type KcpStreamSender = Sender<BytesMut>;
 pub type KcpStreamReceiver = Receiver<BytesMut>;
 
-/// Collapses a log site whose call rate the peer or the network controls into at
-/// most one line per interval, carrying the count of everything suppressed since
-/// the last line. Consumers (rustdesk) write debug-and-up to a log file, so an
-/// unthrottled per-packet site would let a remote peer decide how much a machine
-/// writes to disk.
-struct LogThrottle {
-    interval: std::time::Duration,
-    state: Mutex<(u64, Option<std::time::Instant>)>,
-}
-
-impl LogThrottle {
-    const fn new(interval: std::time::Duration) -> Self {
-        Self {
-            interval,
-            state: Mutex::new((0, None)),
-        }
-    }
-
-    /// Record one occurrence; `Some(n)` = report now, covering `n` occurrences.
-    fn due(&self) -> Option<u64> {
-        let mut state = self.state.lock();
-        state.0 += 1;
-        // `map_or(true, ..)` rather than clippy's preferred `is_none_or`: that was
-        // stabilized in Rust 1.82 and this crate builds with rustdesk's pinned 1.75.
-        #[allow(clippy::unnecessary_map_or)]
-        let due = state.1.map_or(true, |last| last.elapsed() >= self.interval);
-        if !due {
-            return None;
-        }
-        state.1 = Some(std::time::Instant::now());
-        Some(std::mem::replace(&mut state.0, 0))
-    }
-}
-
-const LOG_THROTTLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-static OUTPUT_FULL_LOG: LogThrottle = LogThrottle::new(LOG_THROTTLE_INTERVAL);
-static BAD_INPUT_LOG: LogThrottle = LogThrottle::new(LOG_THROTTLE_INTERVAL);
+// Logging rule for this module: a site whose call rate a peer or the network
+// controls must either sit at `trace` (consumers write debug-and-up to disk, so
+// trace costs them nothing) or go through `throttled_log!`. Only sites bounded
+// by our own code - once per conn, once per endpoint - may log unthrottled at
+// debug and above.
+use crate::log_throttle::throttled_log;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnId {
@@ -167,13 +136,11 @@ impl KcpConnection {
                         // Throttled: this callback runs per packet inside ikcp_flush
                         // under the kcp lock, and a stalled consumer would otherwise
                         // write hundreds of lines per second from under it.
-                        if let Some(n) = OUTPUT_FULL_LOG.due() {
-                            log::warn!(
-                                "kcp output channel full x{}, packet dropped, conn: {:?}",
-                                n,
-                                conn_id
-                            );
-                        }
+                        throttled_log!(
+                            warn,
+                            "kcp output channel full, packet dropped, conn: {:?}",
+                            conn_id
+                        );
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                         // Normal during endpoint teardown; also fires per remaining
@@ -333,7 +300,10 @@ impl KcpConnection {
                 // the yield await below.
                 let recv_ret = kcp.lock().recv(&mut buf);
                 if let Err(e) = recv_ret {
-                    log::error!("recv data failed: {:?}", e);
+                    // Throttled: the retry below yields rather than parking, so a
+                    // persistently failing ikcp_recv would otherwise write this line
+                    // as fast as the scheduler can turn the loop over.
+                    throttled_log!(error, "recv data failed: {:?}, conn: {:?}", e, conn_id);
                     // Every known recv error self-heals on retry (-3 re-reads
                     // peeksize and grows the buffer above), but a persistent one
                     // must not busy-spin the worker. Yield instead of parking on
@@ -648,7 +618,10 @@ impl KcpEndpoint {
             log::trace!("sending pong packet: {:?}", out_packet);
             let ret = output_sender.send(out_packet).await;
             if let Err(e) = ret {
-                log::error!("send pong packet failed: {:?}", e);
+                // A blocking send only errors on a closed channel, i.e. endpoint
+                // teardown - and this runs once per incoming ping, a rate the peer
+                // sets. Trace, not error.
+                log::trace!("send pong packet failed: {:?}", e);
             }
         }
 
@@ -682,14 +655,12 @@ impl KcpEndpoint {
                     if let Some(mut conn) = data.conn_map.get_mut(&conv) {
                         if let Err(e) = conn.handle_input(&packet) {
                             // Malformed input arrives at the peer's rate; throttle.
-                            if let Some(n) = BAD_INPUT_LOG.due() {
-                                log::warn!(
-                                    "handle input on connection failed x{}, last: {:?}, conv: {:?}",
-                                    n,
-                                    e,
-                                    conv
-                                );
-                            }
+                            throttled_log!(
+                                warn,
+                                "handle input on connection failed, last: {:?}, conv: {:?}",
+                                e,
+                                conv
+                            );
                         } else {
                             log::trace!("handle input on connection done, conv: {:?}", conv);
                         }
@@ -769,13 +740,16 @@ impl KcpEndpoint {
                     // Refuse it visibly instead. Only for server-side conns: a
                     // client's own connect() is delivered through its notify, and
                     // its channel entry going unconsumed is the normal case.
-                    log::warn!("accept backlog full, resetting conn: {:?}", conv);
+                    // Throttled: a peer opening handshakes faster than accept()
+                    // consumes them drives this line.
+                    throttled_log!(warn, "accept backlog full, resetting conn: {:?}", conv);
                     data.state_map.remove(&conv);
                     let mut rst = KcpPacket::new(0);
                     rst.mut_header().set_rst(true);
                     conv.fill_packet_header(&mut rst);
                     if let Err(e) = output_sender.send(rst).await {
-                        log::warn!("send reset packet failed: {:?}, conv: {:?}", e, conv);
+                        // Teardown-only, same peer-driven rate. Trace.
+                        log::trace!("send reset packet failed: {:?}, conv: {:?}", e, conv);
                     }
                     continue;
                 }
@@ -795,8 +769,11 @@ impl KcpEndpoint {
                     // first thing needed when users report drops - but only on the
                     // transition: until the <=10s reap, every retransmitted packet
                     // reaching the Closed state would re-log the same line.
+                    // Throttled on top of that: how many conns a peer opens and
+                    // tears down is the peer's choice.
                     if closed_now {
-                        log::info!(
+                        throttled_log!(
+                            info,
                             "kcp conn closed by peer packet (rst: {}, fin: {}), conv: {:?}",
                             packet.header().is_rst(),
                             packet.header().is_fin(),
@@ -811,7 +788,9 @@ impl KcpEndpoint {
                     log::trace!("sending output packet, conv: {:?}: {:?}", conv, out_packet);
                     let ret = output_sender.send(out_packet).await;
                     if let Err(e) = ret {
-                        log::warn!("send output packet failed: {:?}", e);
+                        // Teardown-only (blocking send), once per FSM response, so at
+                        // the peer's packet rate. Trace.
+                        log::trace!("send output packet failed: {:?}", e);
                     }
                 }
             }
@@ -834,8 +813,11 @@ impl KcpEndpoint {
                 });
                 for (conn_id, since) in reaped {
                     // A silent reap was indistinguishable from every other way a
-                    // session can end; name the reason for field diagnosis.
-                    log::info!(
+                    // session can end; name the reason for field diagnosis. Throttled:
+                    // a peer that opens many conns and walks away has them all reaped
+                    // in one sweep.
+                    throttled_log!(
+                        info,
                         "kcp conn reaped by pong timeout ({:?} since last packet), conv: {:?}",
                         since,
                         conn_id
@@ -980,6 +962,33 @@ impl KcpEndpoint {
         let close_notifier = conn.send_close_notifier();
 
         data.conn_map.insert(conn_id, conn);
+
+        // Callers release their state_map guard before calling us (our failure paths
+        // take that shard's write lock), which opens a window: a peer FIN/RST landing
+        // between the caller's Established check and the insert above is processed by
+        // the packet loop while conn_map has nothing to act on, so its close is lost -
+        // a missed FIN leaves this receiver open forever (PeerClosed is not reaped and
+        // the peer's pongs keep the pong timer fresh), a missed RST hands back a conn
+        // that is already dead. Re-apply the close state now that the conn is
+        // installed; anything after this point the packet loop sees for itself.
+        let state = data.state_map.get(&conn_id);
+        let (peer_closed, closed) = state
+            .as_ref()
+            .map(|state| (state.is_peer_closed(), state.is_closed()))
+            // No state at all: reaped, or refused by the accept-backlog path.
+            .unwrap_or((true, true));
+        // Lock order: never hold a guard on one map while touching the other.
+        drop(state);
+
+        if closed {
+            data.conn_map.remove(&conn_id);
+            return Err(Error::ConnectioinReset);
+        }
+        if peer_closed {
+            if let Some(conn) = data.conn_map.get_mut(&conn_id) {
+                conn.close_recv();
+            }
+        }
 
         let output_sender = self.output_sender.clone();
         let data = Arc::downgrade(&data);
@@ -1183,8 +1192,15 @@ impl KcpEndpoint {
             drop(state);
 
             if established {
-                self.add_conn(conn_id)?;
-                return Ok(conn_id);
+                match self.add_conn(conn_id) {
+                    Ok(()) => return Ok(conn_id),
+                    // Raced with a peer close: that conn is gone, so wait for the
+                    // next one rather than killing the caller's accept loop. Every
+                    // other error is deterministic (a config the factory keeps
+                    // producing) and must fail-stop, not spin.
+                    Err(Error::ConnectioinReset) => continue,
+                    Err(e) => return Err(e),
+                }
             }
         }
     }
@@ -1357,6 +1373,49 @@ mod tests {
             c.mtu = Some(1); // rejected by ikcp_setmtu (< 50)
             c
         })
+    }
+
+    // Drives add_conn against a state that already moved on, which is what a peer
+    // FIN/RST landing between the caller's Established check and conn_map insertion
+    // produces: the packet loop finds no conn to act on, so add_conn must re-apply
+    // the close itself.
+    async fn established_pair() -> (KcpEndpoint, KcpEndpoint, ConnId, JoinSet<()>) {
+        let (client_endpoint, server_endpoint, t) = prepare_test().await;
+        let (connect_ret, accept_ret) = tokio::join!(
+            client_endpoint.connect(std::time::Duration::from_secs(5), 1, 3, Bytes::new()),
+            server_endpoint.accept()
+        );
+        let conv = connect_ret.unwrap();
+        assert_eq!(conv, accept_ret.unwrap());
+        (client_endpoint, server_endpoint, conv, t)
+    }
+
+    #[tokio::test]
+    async fn test_peer_close_racing_conn_setup_is_not_lost() {
+        let (client_endpoint, server_endpoint, conv, t) = established_pair().await;
+
+        // FIN processed while conn_map was still empty.
+        client_endpoint.data.state_map.get_mut(&conv).unwrap().fsm = KcpConnectionFSM::PeerClosed;
+        client_endpoint
+            .add_conn(conv)
+            .expect("half-close is not a setup failure");
+        let (_s, mut receiver) = client_endpoint.conn_sender_receiver(conv).unwrap();
+        let eof = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("a FIN lost in the setup window leaves the receiver open forever");
+        assert!(eof.is_none(), "receiver must end after the missed FIN");
+
+        // RST processed while conn_map was still empty.
+        client_endpoint.data.state_map.get_mut(&conv).unwrap().fsm = KcpConnectionFSM::Closed;
+        assert!(
+            matches!(client_endpoint.add_conn(conv), Err(Error::ConnectioinReset)),
+            "a conn closed during setup must not be handed back as live"
+        );
+        assert!(!client_endpoint.data.conn_map.contains_key(&conv));
+
+        drop(client_endpoint);
+        drop(server_endpoint);
+        t.join_all().await;
     }
 
     #[tokio::test]
@@ -1705,10 +1764,10 @@ mod tests {
 
         let (connect_ret, accept_ret) = tokio::join!(
             client_endpoint.connect(std::time::Duration::from_secs(5), 1, 3, Bytes::new()),
-            server_endpoint.accept()
+            tokio::time::timeout(std::time::Duration::from_secs(30), server_endpoint.accept())
         );
         let conv = connect_ret.unwrap();
-        assert_eq!(conv, accept_ret.unwrap());
+        assert_eq!(conv, accept_ret.expect("accept must not hang").unwrap());
 
         let (client_sender, _cr) = client_endpoint.conn_sender_receiver(conv).unwrap();
         let (_ss, mut server_receiver) = server_endpoint.conn_sender_receiver(conv).unwrap();
@@ -1740,10 +1799,10 @@ mod tests {
 
         let (connect_ret, accept_ret) = tokio::join!(
             client_endpoint.connect(std::time::Duration::from_secs(1), 1, 3, Bytes::new()),
-            server_endpoint.accept()
+            tokio::time::timeout(std::time::Duration::from_secs(30), server_endpoint.accept())
         );
         let conv = connect_ret.unwrap();
-        assert_eq!(conv, accept_ret.unwrap());
+        assert_eq!(conv, accept_ret.expect("accept must not hang").unwrap());
 
         let (client_sender, _cr) = client_endpoint.conn_sender_receiver(conv).unwrap();
         let (_ss, mut server_receiver) = server_endpoint.conn_sender_receiver(conv).unwrap();
