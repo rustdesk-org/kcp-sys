@@ -983,12 +983,16 @@ mod tests {
         (client_endpoint, server_endpoint, t)
     }
 
-    // Same wiring as prepare_test, but drops the first `client_drop` packets on the
-    // client->server path and the first `server_drop` packets on the server->client path,
-    // simulating datagram loss right after hole punching.
+    // Same wiring as prepare_test, but with flag-targeted handshake loss: drops the
+    // first `syn_drop` SYN packets and the first `ack_drop` handshake ACK+data replies
+    // on the client->server path, and the first `syn_ack_drop` SYN-ACK packets on the
+    // server->client path. Targeted by handshake flags, not by position: the endpoint
+    // interleaves other traffic (pings, retransmits), so a positional drop budget gets
+    // absorbed by unrelated packets and the handshake packet sails through untouched.
     async fn prepare_test_lossy(
-        client_drop: usize,
-        server_drop: usize,
+        syn_drop: usize,
+        syn_ack_drop: usize,
+        ack_drop: usize,
     ) -> (KcpEndpoint, KcpEndpoint, JoinSet<()>) {
         let mut client_endpoint = KcpEndpoint::new();
         let mut server_endpoint = KcpEndpoint::new();
@@ -1000,10 +1004,11 @@ mod tests {
         let client_input_sender = client_endpoint.input_sender();
         let mut server_output_receiver = server_endpoint.output_receiver().unwrap();
         t.spawn(async move {
-            let mut seen = 0usize;
+            let mut dropped = 0usize;
             while let Some(packet) = server_output_receiver.recv().await {
-                seen += 1;
-                if seen <= server_drop {
+                let h = packet.header();
+                if h.is_syn() && h.is_ack() && dropped < syn_ack_drop {
+                    dropped += 1;
                     continue;
                 }
                 let _ = client_input_sender.send(packet).await;
@@ -1013,10 +1018,22 @@ mod tests {
         let server_input_sender = server_endpoint.input_sender();
         let mut client_output_receiver = client_endpoint.output_receiver().unwrap();
         t.spawn(async move {
-            let mut seen = 0usize;
+            let mut syn_dropped = 0usize;
+            let mut ack_dropped = 0usize;
             while let Some(packet) = client_output_receiver.recv().await {
-                seen += 1;
-                if seen <= client_drop {
+                let h = packet.header();
+                if h.is_syn() && !h.is_ack() && syn_dropped < syn_drop {
+                    syn_dropped += 1;
+                    continue;
+                }
+                // The handshake completion is the only ACK+data packet with an empty
+                // payload; KCP data segments always carry bytes.
+                if h.is_ack()
+                    && h.is_data()
+                    && packet.payload().is_empty()
+                    && ack_dropped < ack_drop
+                {
+                    ack_dropped += 1;
                     continue;
                 }
                 let _ = server_input_sender.send(packet).await;
@@ -1028,23 +1045,61 @@ mod tests {
 
     #[tokio::test]
     async fn test_kcp_connect_with_handshake_loss() {
-        // Drop the client's first SYN and the server's first SYN-ACK. Without SYN
-        // retransmission plus idempotent SYN-ACK handling, this connect would hang until
-        // the timeout and fail.
-        let (client_endpoint, server_endpoint, t) = prepare_test_lossy(1, 1).await;
+        // Drop the client's first SYN and the server's first SYN-ACK. Recovery needs
+        // connect()'s SYN retransmission (undisturbed by pings) plus the SynReceived
+        // duplicate-SYN branch re-emitting the SYN-ACK. accept() is bounded so a
+        // regression fails the test instead of hanging the job.
+        let (client_endpoint, server_endpoint, t) = prepare_test_lossy(1, 1, 0).await;
 
         let (connect_ret, accept_ret) = tokio::join!(
             client_endpoint.connect(std::time::Duration::from_secs(5), 1, 3, Bytes::from("conn")),
-            server_endpoint.accept()
+            tokio::time::timeout(std::time::Duration::from_secs(10), server_endpoint.accept())
         );
 
         let conv = connect_ret.expect("connect should recover from handshake loss");
         assert_eq!(
             conv,
-            accept_ret.expect("accept should recover from handshake loss")
+            accept_ret
+                .expect("accept should not outlive connect's deadline")
+                .expect("accept should recover from handshake loss")
         );
 
         // Data must still flow over the recovered handshake.
+        let (client_sender, _client_receiver) = client_endpoint.conn_sender_receiver(conv).unwrap();
+        let (_server_sender, mut server_receiver) =
+            server_endpoint.conn_sender_receiver(conv).unwrap();
+
+        client_sender.send(BytesMut::from("hello")).await.unwrap();
+        let data = server_receiver.recv().await.unwrap();
+        assert_eq!("hello", String::from_utf8_lossy(&data));
+
+        drop(client_endpoint);
+        drop(server_endpoint);
+        t.join_all().await;
+    }
+
+    #[tokio::test]
+    async fn test_kcp_connect_with_ack_loss() {
+        // Drop the client's handshake ACK+data reply (third packet). The client is
+        // already Established and will never send another SYN, so only the server's
+        // periodic SYN-ACK retransmit plus the client's duplicate-SYN-ACK re-ACK can
+        // finish the handshake and unblock accept().
+        let (client_endpoint, server_endpoint, t) = prepare_test_lossy(0, 0, 1).await;
+
+        let (connect_ret, accept_ret) = tokio::join!(
+            client_endpoint.connect(std::time::Duration::from_secs(5), 1, 3, Bytes::from("conn")),
+            tokio::time::timeout(std::time::Duration::from_secs(10), server_endpoint.accept())
+        );
+
+        let conv = connect_ret.expect("connect side is unaffected by the lost ACK");
+        assert_eq!(
+            conv,
+            accept_ret
+                .expect("accept must be unblocked by the SYN-ACK retransmit")
+                .expect("accept should recover from ACK loss")
+        );
+
+        // Data must flow over the recovered handshake.
         let (client_sender, _client_receiver) = client_endpoint.conn_sender_receiver(conv).unwrap();
         let (_server_sender, mut server_receiver) =
             server_endpoint.conn_sender_receiver(conv).unwrap();
@@ -1172,10 +1227,15 @@ mod tests {
 
         let (connect_ret, accept_ret) = tokio::join!(
             client_endpoint.connect(std::time::Duration::from_secs(10), 1, 3, Bytes::new()),
-            server_endpoint.accept()
+            tokio::time::timeout(std::time::Duration::from_secs(20), server_endpoint.accept())
         );
         let conv = connect_ret.expect("connect must survive lossy handshake");
-        assert_eq!(conv, accept_ret.unwrap());
+        assert_eq!(
+            conv,
+            accept_ret
+                .expect("accept timed out under sustained loss")
+                .unwrap()
+        );
 
         let (client_sender, _cr) = client_endpoint.conn_sender_receiver(conv).unwrap();
         let (_ss, mut server_receiver) = server_endpoint.conn_sender_receiver(conv).unwrap();
