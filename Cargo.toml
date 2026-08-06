@@ -30,3 +30,7 @@ bindgen = { version = "0.72.1", default-features = false, features = [
     "runtime",
 ] }
 cc = "1.2.10"
+
+[dev-dependencies]
+# test-util enables tokio::test(start_paused) for virtual-time tests.
+tokio = { version = "1", features = ["full", "test-util"] }
