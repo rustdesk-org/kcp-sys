@@ -235,8 +235,13 @@ impl From<KcpPacket> for Bytes {
 
 impl KcpPacket {
     pub fn new(body_size: usize) -> Self {
-        let mut inner = BytesMut::with_capacity(std::mem::size_of::<KcpPacketHeader>() + body_size);
-        inner.resize(inner.capacity(), 0);
+        // Size to the request, not to capacity(): the allocator may hand back more
+        // than was asked for, and resizing to that made every control packet
+        // (ping, SYN-ACK, RST, FIN - all built with body_size 0) trail whatever
+        // slack the allocation happened to carry, as zero payload on the wire.
+        let len = std::mem::size_of::<KcpPacketHeader>() + body_size;
+        let mut inner = BytesMut::with_capacity(len);
+        inner.resize(len, 0);
         Self { inner }
     }
 
@@ -270,5 +275,80 @@ impl KcpPacket {
 
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HEADER_LEN: usize = std::mem::size_of::<KcpPacketHeader>();
+
+    // Every accessor parses the fixed-size prefix and slices past it, so a packet
+    // shorter than the header would panic - and rustdesk builds with panic='abort',
+    // making that a process kill rather than a task failure. Nothing may construct
+    // one. This pins the invariant at all four construction sites, including the
+    // From<BytesMut> that turns arbitrary network bytes into a packet.
+    fn assert_accessors_are_safe(mut p: KcpPacket) {
+        assert!(p.len() >= HEADER_LEN, "packet shorter than its header");
+        let _ = p.header().conv();
+        let _ = p.mut_header().set_syn(true);
+        let _ = p.payload();
+    }
+
+    #[test]
+    fn construction_never_yields_a_packet_shorter_than_the_header() {
+        assert_accessors_are_safe(KcpPacket::new(0));
+        assert_accessors_are_safe(KcpPacket::default());
+        assert_accessors_are_safe(KcpPacket::new_with_payload(&[]));
+        for short in 0..HEADER_LEN {
+            assert_accessors_are_safe(KcpPacket::from(BytesMut::from(&vec![0xABu8; short][..])));
+        }
+    }
+
+    #[test]
+    fn new_sizes_to_the_request() {
+        // new() sizes to the request rather than to capacity(), which the allocator
+        // is free to round up. Note this test cannot prove that on its own: every
+        // BytesMut::with_capacity(n) measured here returns capacity exactly n, so
+        // both spellings agree today. The point is not to depend on that.
+        for body in [0usize, 1, 7, 64, 1200] {
+            let p = KcpPacket::new(body);
+            assert_eq!(p.len(), HEADER_LEN + body, "body_size {body}");
+            assert_eq!(p.payload().len(), body, "body_size {body}");
+        }
+        assert!(KcpPacket::new(0).payload().is_empty());
+    }
+
+    #[test]
+    fn from_bytes_preserves_payload_and_pads_only_short_input() {
+        let payload = b"payload";
+        let mut bytes = BytesMut::from(&[0u8; HEADER_LEN][..]);
+        bytes.extend_from_slice(payload);
+        let p = KcpPacket::from(bytes);
+        assert_eq!(
+            p.payload(),
+            payload,
+            "a full-length buffer must pass through"
+        );
+
+        // Short input is padded to exactly the header, never further.
+        let p = KcpPacket::from(BytesMut::from(&[0xABu8; 3][..]));
+        assert_eq!(p.len(), HEADER_LEN);
+        assert!(p.payload().is_empty());
+    }
+
+    #[test]
+    fn every_flag_byte_parses() {
+        // header() unwraps from_bits(); the bitflags `_ = !0` arm is what makes
+        // that infallible for attacker-chosen bytes. Drop the arm and this fails.
+        for flag in 0u8..=255 {
+            let mut bytes = BytesMut::from(&[0u8; HEADER_LEN][..]);
+            bytes[12] = flag;
+            let p = KcpPacket::from(bytes);
+            let h = p.header();
+            let _ = (h.is_syn(), h.is_ack(), h.is_fin(), h.is_data(), h.is_rst());
+            let _ = (h.is_ping(), h.is_pong());
+        }
     }
 }
