@@ -419,7 +419,9 @@ struct KcpConnectionState {
     fsm: KcpConnectionFSM,
     notify: Arc<Notify>,
     conn_data: Bytes,
-    last_pong: std::time::Instant,
+    // Refreshed by every valid inbound packet, not just pongs: this is when the peer was
+    // last heard from, which is what both the reaper and `peer_silent_for` want.
+    last_rx: std::time::Instant,
     // Timer-driven SYN-ACK retransmits consumed so far (see the liveness
     // task). Atomic so the liveness scan can consume budget under DashMap's
     // shard read lock; that task is the only writer. The budget is never
@@ -444,13 +446,13 @@ impl KcpConnectionState {
             fsm,
             notify: Arc::new(Notify::new()),
             conn_data: Bytes::new(),
-            last_pong: std::time::Instant::now(),
+            last_rx: std::time::Instant::now(),
             syn_ack_retries: AtomicU32::new(0),
         }
     }
 
     fn handle_packet(&mut self, packet: &KcpPacket) -> Result<Option<KcpPacket>, Error> {
-        self.notify_pong();
+        self.note_rx();
         let mut out_packet = None;
         let old_state = self.fsm;
         let res = self.fsm.handle_packet(packet, &mut out_packet);
@@ -504,12 +506,16 @@ impl KcpConnectionState {
         self.conn_data = data;
     }
 
-    fn notify_pong(&mut self) {
-        self.last_pong = std::time::Instant::now();
+    fn note_rx(&mut self) {
+        self.last_rx = std::time::Instant::now();
     }
 
-    fn is_pong_timeout(&self) -> bool {
-        self.last_pong.elapsed() > std::time::Duration::from_secs(60)
+    fn silent_for(&self) -> std::time::Duration {
+        self.last_rx.elapsed()
+    }
+
+    fn is_rx_timeout(&self) -> bool {
+        self.silent_for() > std::time::Duration::from_secs(60)
     }
 }
 
@@ -655,10 +661,10 @@ impl KcpEndpoint {
             }
         }
 
-        // all incoming packet should update pong time
+        // all incoming packet should update the last-heard-from time
         let conv = ConnId::from(packet);
         if let Some(mut state) = data.state_map.get_mut(&conv) {
-            state.notify_pong();
+            state.note_rx();
         }
 
         packet.header().is_ping()
@@ -835,9 +841,9 @@ impl KcpEndpoint {
                 let mut reaped = Vec::new();
                 data.state_map.retain(|conn_id, state| {
                     let closed = matches!(state.fsm, KcpConnectionFSM::Closed);
-                    let timed_out = state.is_pong_timeout();
+                    let timed_out = state.is_rx_timeout();
                     if timed_out && !closed {
-                        reaped.push((*conn_id, state.last_pong.elapsed()));
+                        reaped.push((*conn_id, state.silent_for()));
                     }
                     !closed && !timed_out
                 });
@@ -848,7 +854,7 @@ impl KcpEndpoint {
                     // in one sweep.
                     throttled_log!(
                         info,
-                        "kcp conn reaped by pong timeout ({:?} since last packet), conv: {:?}",
+                        "kcp conn reaped by peer silence ({:?} since last packet), conv: {:?}",
                         since,
                         conn_id
                     );
@@ -882,12 +888,16 @@ impl KcpEndpoint {
         // - everything is try_send with no pacing sleeps, keeping the loop
         //   free of awaits under the scan. A full channel skips the packet
         //   until the next round - channel pressure means traffic is flowing,
-        //   which already keeps the peer's pong timer fresh.
+        //   which already keeps the peer's silence timer fresh.
         let data = self.data.clone();
         let output_sender = self.output_sender.clone();
         self.tasks.spawn(async move {
             const TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-            const PING_SLOTS: u32 = 10;
+            // Two, not ten: `peer_silent_for` is what callers use to decide a peer is gone, and
+            // an idle connection can only be as fresh as this cadence. A detector aiming at ~8s
+            // needs several pings inside that window, and one small packet every 2s per
+            // connection is not worth trading that margin for.
+            const PING_SLOTS: u32 = 2;
             let mut slot = 0u32;
             loop {
                 let mut packets = Vec::new();
@@ -937,7 +947,7 @@ impl KcpEndpoint {
                         // The close watcher emits the FIN exactly once and nothing
                         // below this layer retransmits it, so a single lost FIN
                         // datagram would leave the peer half-open forever: both sides
-                        // keep answering pings, the pong reaper never fires, and the
+                        // keep answering pings, the silence reaper never fires, and the
                         // peer's reader blocks indefinitely. Re-emit the FIN on the
                         // ping cadence until the peer's FIN/RST moves us to Closed -
                         // a duplicate FIN is idempotent in every peer state, and it
@@ -1049,6 +1059,14 @@ impl KcpEndpoint {
             return None;
         };
         Some((send_sender, recv_receiver))
+    }
+
+    /// How long since a valid packet was last received from the peer on this connection, or
+    /// `None` if the connection is gone. Maintained by the endpoint's own tasks, so it keeps
+    /// answering while the caller is busy elsewhere, and the liveness task's ping guarantees the
+    /// peer answers even when neither side has application data to send.
+    pub fn peer_silent_for(&self, conn_id: &ConnId) -> Option<std::time::Duration> {
+        Some(self.data.state_map.get(conn_id)?.silent_for())
     }
 
     pub fn conn_data(&self, conn_id: &ConnId) -> Option<Bytes> {
@@ -1271,6 +1289,74 @@ mod tests {
         });
 
         (client_endpoint, server_endpoint, t)
+    }
+
+    // What a caller polling `peer_silent_for` depends on: an idle connection carries no
+    // application traffic at all, so the only thing keeping the value low is the liveness task's
+    // ping and the peer's reply. At the previous 10s cadence this stayed useless for a detector
+    // working on an ~8s budget.
+    #[tokio::test]
+    async fn test_peer_silent_for_stays_fresh_while_idle() {
+        let (client_endpoint, server_endpoint, t) = prepare_test().await;
+        let (connect_ret, accept_ret) = tokio::join!(
+            client_endpoint.connect(std::time::Duration::from_secs(5), 1, 3, Bytes::from("conn")),
+            tokio::time::timeout(std::time::Duration::from_secs(10), server_endpoint.accept())
+        );
+        let conv = connect_ret.expect("connect");
+        assert_eq!(conv, accept_ret.expect("accept deadline").expect("accept"));
+
+        let unknown = ConnId {
+            conv: u32::MAX,
+            src_session_id: 0,
+            dst_session_id: 0,
+        };
+        assert!(client_endpoint.peer_silent_for(&unknown).is_none());
+
+        // No application traffic for the whole window; the ping cadence alone has to hold it down.
+        let mut worst = std::time::Duration::ZERO;
+        for _ in 0..25 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            for silence in [
+                client_endpoint.peer_silent_for(&conv).expect("client state"),
+                server_endpoint.peer_silent_for(&conv).expect("server state"),
+            ] {
+                worst = worst.max(silence);
+            }
+        }
+        assert!(
+            worst < std::time::Duration::from_secs(4),
+            "idle peer looked silent for {worst:?}; the ping cadence is too slow to detect a dead \
+             peer within a few seconds"
+        );
+
+        drop(client_endpoint);
+        drop(server_endpoint);
+        t.join_all().await;
+    }
+
+    // The other direction of the same promise: the clock has to keep climbing once the peer is
+    // really gone, or a caller polling it would wait forever. Nothing here answers for the peer,
+    // so this is what a killed process or a severed link looks like.
+    #[tokio::test]
+    async fn test_peer_silent_for_grows_once_the_peer_is_gone() {
+        let (client_endpoint, server_endpoint, mut t) = prepare_test().await;
+        let (connect_ret, accept_ret) = tokio::join!(
+            client_endpoint.connect(std::time::Duration::from_secs(5), 1, 3, Bytes::from("conn")),
+            tokio::time::timeout(std::time::Duration::from_secs(10), server_endpoint.accept())
+        );
+        let conv = connect_ret.expect("connect");
+        assert_eq!(conv, accept_ret.expect("accept deadline").expect("accept"));
+
+        // Drop the peer and the tasks carrying its packets: nothing reaches the client again.
+        drop(server_endpoint);
+        t.abort_all();
+
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let silence = client_endpoint.peer_silent_for(&conv).expect("client state");
+        assert!(
+            silence > std::time::Duration::from_millis(2_500),
+            "a gone peer looked silent for only {silence:?}"
+        );
     }
 
     #[tokio::test]
